@@ -1,0 +1,1 @@
+note -- local note-taking CLI. Create, list, search, tag, and delete plain-text notes. All data stored in ~/.note/ as JSON. Default output is JSON for agent consumption; use --human for formatted display.

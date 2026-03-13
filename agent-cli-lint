@@ -2310,12 +2310,13 @@ check_F7() {
   fi
   # Check response has required fields
   local has_id has_type has_status has_message has_created has_updated
-  if echo "$RUN_STDOUT" | jq -e '.id' >/dev/null 2>&1; then has_id="yes"; else has_id="no"; fi
-  if echo "$RUN_STDOUT" | jq -e '.type' >/dev/null 2>&1; then has_type="yes"; else has_type="no"; fi
-  if echo "$RUN_STDOUT" | jq -e '.status' >/dev/null 2>&1; then has_status="yes"; else has_status="no"; fi
-  if echo "$RUN_STDOUT" | jq -e '.message' >/dev/null 2>&1; then has_message="yes"; else has_message="no"; fi
-  if echo "$RUN_STDOUT" | jq -e '.created_at // .created' >/dev/null 2>&1; then has_created="yes"; else has_created="no"; fi
-  if echo "$RUN_STDOUT" | jq -e '.updated_at // .updated' >/dev/null 2>&1; then has_updated="yes"; else has_updated="no"; fi
+  # Check both top-level and .result envelope (response may wrap data in {result: ..., rules: ..., skills: ..., issue: ...})
+  if echo "$RUN_STDOUT" | jq -e '.id // .result.id' >/dev/null 2>&1; then has_id="yes"; else has_id="no"; fi
+  if echo "$RUN_STDOUT" | jq -e '.type // .result.type' >/dev/null 2>&1; then has_type="yes"; else has_type="no"; fi
+  if echo "$RUN_STDOUT" | jq -e '.status // .result.status' >/dev/null 2>&1; then has_status="yes"; else has_status="no"; fi
+  if echo "$RUN_STDOUT" | jq -e '.message // .result.message' >/dev/null 2>&1; then has_message="yes"; else has_message="no"; fi
+  if echo "$RUN_STDOUT" | jq -e '.created_at // .created // .result.created_at // .result.created' >/dev/null 2>&1; then has_created="yes"; else has_created="no"; fi
+  if echo "$RUN_STDOUT" | jq -e '.updated_at // .updated // .result.updated_at // .result.updated' >/dev/null 2>&1; then has_updated="yes"; else has_updated="no"; fi
   local missing=""
   [[ "$has_id" != "yes" ]] && missing="$missing id"
   [[ "$has_type" != "yes" ]] && missing="$missing type"
@@ -2383,9 +2384,9 @@ RULE_REGISTRY=(
   "D16|--agent/--human mode|01|Discoverability|P1|check_D16"
   "D17|agent/rules/ frontmatter|01|Discoverability|P1|check_D17"
   "D18|agent/skills/ frontmatter|01|Discoverability|P1|check_D18"
-  "R1|response includes rules[]|02|Output|P0|check_R1"
-  "R2|response includes skills[]|02|Output|P0|check_R2"
-  "R3|response includes issue|02|Output|P0|check_R3"
+  "R1|response includes rules[]|02|Output|P1|check_R1"
+  "R2|response includes skills[]|02|Output|P1|check_R2"
+  "R3|response includes issue|02|Output|P1|check_R3"
   "O1|default JSON output|02|Output|P0|check_O1"
   "O2|valid JSON|02|Output|P0|check_O2"
   "O3|schema stability|02|Output|P0|check_O3"

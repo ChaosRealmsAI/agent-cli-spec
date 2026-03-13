@@ -20,9 +20,9 @@ Use this file when you need to look up a specific rule's details.
 
 ## Priority Breakdown
 
-- **P0** (15 rules): R1 R2 R3 O1 O2 O3 E1 E4 E5 E7 E8 X3 X9 C1 C2
-- **P1** (23 rules): D1 D3 D4 D7 D9 D11 D12 D13 D15 D16 D17 D18 I1 I2 I4 I5 I8 I9 S1 S4 S8 C6 N4 E6 G1 G2 G3 G6 G8 G9
-- **P2** (60 rules): everything else
+- **P0** (12 rules): O1 O2 O3 E1 E4 E5 E7 E8 X3 X9 C1 C2
+- **P1** (34 rules): D1 D3 D4 D7 D9 D11 D12 D13 D15 D16 D17 D18 R1 R2 R3 E6 I1 I2 I4 I5 I8 I9 S1 S4 S8 X1 C6 N4 G1 G2 G3 G6 G8 G9
+- **P2** (52 rules): everything else
 
 ## Layer Breakdown
 
@@ -38,7 +38,7 @@ Use this file when you need to look up a specific rule's details.
 
 ## New Rules (v0.1.1)
 
-### Response Structure (P0)
+### Response Structure (P1)
 - R1: Every command response MUST include `rules[]` (full content from agent/rules/*.md)
 - R2: Every command response MUST include `skills[]` (name + description + command)
 - R3: Every command response MUST include `issue` (feedback guide)
@@ -77,7 +77,6 @@ Use this file when you need to look up a specific rule's details.
 - S7: Even with --quiet, destructive ops still require --yes
 
 ### Exit Code (P2)
-- X1: 0 = success (the only success code)
 - X2: 1 = general error (fallback)
 - X4: 10 = auth failure
 - X5: 11 = permission denied
