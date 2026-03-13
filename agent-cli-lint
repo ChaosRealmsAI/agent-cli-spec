@@ -219,7 +219,7 @@ cmd_describe() {
         {"name": "priority", "type": "string", "required": false, "enum": ["p0", "p1", "p2"], "description": "Filter by priority"},
         {"name": "rule", "type": "string", "required": false, "description": "Check single rule by ID (e.g. O1)"}
       ],
-      "output": {"type": "object", "properties": {"tool": "string", "summary": "object", "layers": "array", "certification": "object", "dimensions": "array"}}
+      "output": {"type": "object", "properties": {"tool": "string", "scope": "object", "summary": "object", "layers": "array", "certification": "object", "dimensions": "array"}}
     },
     {
       "name": "snapshot",
@@ -420,6 +420,10 @@ run_with_timeout() {
 
 # Results accumulator
 declare -a RESULTS=()
+ACTIVE_DIMENSION=""
+ACTIVE_LAYER=""
+ACTIVE_PRIORITY=""
+ACTIVE_RULE=""
 
 emit_result() {
   local id="$1" status="$2" detail="$3" suggestion="${4:-}"
@@ -2364,11 +2368,21 @@ rule_layer() {
   esac
 }
 
+rule_matches_active_filters() {
+  local rid="$1" rdim="$2" rpri="$3"
+  [[ -n "$ACTIVE_DIMENSION" && "$rdim" != "$ACTIVE_DIMENSION" ]] && return 1
+  [[ -n "$ACTIVE_LAYER" && "$(rule_layer "$rid")" != "$ACTIVE_LAYER" ]] && return 1
+  [[ -n "$ACTIVE_PRIORITY" && "$(echo "$rpri" | tr '[:upper:]' '[:lower:]')" != "$ACTIVE_PRIORITY" ]] && return 1
+  [[ -n "$ACTIVE_RULE" && "$rid" != "$ACTIVE_RULE" ]] && return 1
+  return 0
+}
+
 build_layer_json() {
-  local name="$1" total="$2" checked="$3" passed="$4" failed="$5" skipped="$6" ai="$7" warned="$8" compliant="$9"
+  local name="$1" total="$2" selected="$3" checked="$4" passed="$5" failed="$6" skipped="$7" ai="$8" warned="$9" compliant="${10}" eligible="${11}"
   jq -n \
     --arg name "$name" \
     --argjson total "$total" \
+    --argjson selected "$selected" \
     --argjson checked "$checked" \
     --argjson passed "$passed" \
     --argjson failed "$failed" \
@@ -2376,18 +2390,21 @@ build_layer_json() {
     --argjson ai "$ai" \
     --argjson warned "$warned" \
     --argjson compliant "$compliant" \
+    --argjson eligible "$eligible" \
     '{
       name: $name,
       summary: {
         total: $total,
+        selected: $selected,
         checked: $checked,
         passed: $passed,
         failed: $failed,
         skipped: $skipped,
         ai_review: $ai,
         warned: $warned,
-        not_checked: ($total - $checked)
+        not_checked: ($selected - $checked)
       },
+      eligible: $eligible,
       compliant: $compliant
     }'
 }
@@ -2400,6 +2417,8 @@ build_report() {
   local tool_name; tool_name=$(_get_tool_name)
   local tool_version; tool_version=$(_get_tool_version)
   local timestamp; timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  local partial=false
+  [[ -n "$ACTIVE_DIMENSION" || -n "$ACTIVE_LAYER" || -n "$ACTIVE_PRIORITY" || -n "$ACTIVE_RULE" ]] && partial=true
 
   # Count results
   local passed=0 failed=0 skipped=0 ai=0 warned=0 total=${#RESULTS[@]}
@@ -2415,12 +2434,16 @@ build_report() {
   done
 
   # Layered certification requires every rule in the layer to be checked and passed.
-  local core_total=0 core_checked=0 core_passed=0 core_failed=0 core_skipped=0 core_ai=0 core_warned=0 core_compliant=true
-  local rec_total=0 rec_checked=0 rec_passed=0 rec_failed=0 rec_skipped=0 rec_ai=0 rec_warned=0 rec_compliant=true
-  local eco_total=0 eco_checked=0 eco_passed=0 eco_failed=0 eco_skipped=0 eco_ai=0 eco_warned=0 eco_compliant=true
+  local core_total=0 core_selected=0 core_checked=0 core_passed=0 core_failed=0 core_skipped=0 core_ai=0 core_warned=0 core_compliant=true
+  local rec_total=0 rec_selected=0 rec_checked=0 rec_passed=0 rec_failed=0 rec_skipped=0 rec_ai=0 rec_warned=0 rec_compliant=true
+  local eco_total=0 eco_selected=0 eco_checked=0 eco_passed=0 eco_failed=0 eco_skipped=0 eco_ai=0 eco_warned=0 eco_compliant=true
   for entry in "${RULE_REGISTRY[@]}"; do
     IFS='|' read -r rid rname rdim rdname rpri rfunc <<< "$entry"
     local layer; layer=$(rule_layer "$rid")
+    local selected=false
+    if rule_matches_active_filters "$rid" "$rdim" "$rpri"; then
+      selected=true
+    fi
     local status="not_checked"
     for r in "${RESULTS[@]}"; do
       local result_id; result_id=$(echo "$r" | jq -r '.id')
@@ -2432,6 +2455,7 @@ build_report() {
     case "$layer" in
       core)
         core_total=$((core_total + 1))
+        [[ "$selected" == true ]] && core_selected=$((core_selected + 1))
         [[ "$status" != "not_checked" ]] && core_checked=$((core_checked + 1))
         case "$status" in
           pass) core_passed=$((core_passed + 1)) ;;
@@ -2444,6 +2468,7 @@ build_report() {
         ;;
       recommended)
         rec_total=$((rec_total + 1))
+        [[ "$selected" == true ]] && rec_selected=$((rec_selected + 1))
         [[ "$status" != "not_checked" ]] && rec_checked=$((rec_checked + 1))
         case "$status" in
           pass) rec_passed=$((rec_passed + 1)) ;;
@@ -2456,6 +2481,7 @@ build_report() {
         ;;
       ecosystem)
         eco_total=$((eco_total + 1))
+        [[ "$selected" == true ]] && eco_selected=$((eco_selected + 1))
         [[ "$status" != "not_checked" ]] && eco_checked=$((eco_checked + 1))
         case "$status" in
           pass) eco_passed=$((eco_passed + 1)) ;;
@@ -2472,20 +2498,38 @@ build_report() {
     esac
   done
 
-  local agent_friendly=false agent_ready=false agent_native=false
-  [[ "$core_compliant" == true ]] && agent_friendly=true
-  if [[ "$core_compliant" == true && "$rec_compliant" == true ]]; then
-    agent_ready=true
-  fi
-  if [[ "$core_compliant" == true && "$rec_compliant" == true && "$eco_compliant" == true ]]; then
-    agent_native=true
+  local core_eligible=false rec_eligible=false eco_eligible=false
+  [[ "$core_selected" -eq "$core_total" ]] && core_eligible=true
+  [[ "$rec_selected" -eq "$rec_total" ]] && rec_eligible=true
+  [[ "$eco_selected" -eq "$eco_total" ]] && eco_eligible=true
+  local core_compliant_json="null" rec_compliant_json="null" eco_compliant_json="null"
+  [[ "$core_eligible" == true ]] && { [[ "$core_compliant" == true ]] && core_compliant_json="true" || core_compliant_json="false"; }
+  [[ "$rec_eligible" == true ]] && { [[ "$rec_compliant" == true ]] && rec_compliant_json="true" || rec_compliant_json="false"; }
+  [[ "$eco_eligible" == true ]] && { [[ "$eco_compliant" == true ]] && eco_compliant_json="true" || eco_compliant_json="false"; }
+
+  local agent_friendly_json="null" agent_ready_json="null" agent_native_json="null" certification_eligible=false
+  local certification_reason="Certification requires a full run without filters."
+  if [[ "$partial" == false ]]; then
+    certification_eligible=true
+    certification_reason=""
+    [[ "$core_compliant" == true ]] && agent_friendly_json="true" || agent_friendly_json="false"
+    if [[ "$core_compliant" == true && "$rec_compliant" == true ]]; then
+      agent_ready_json="true"
+    else
+      agent_ready_json="false"
+    fi
+    if [[ "$core_compliant" == true && "$rec_compliant" == true && "$eco_compliant" == true ]]; then
+      agent_native_json="true"
+    else
+      agent_native_json="false"
+    fi
   fi
 
   local layers
   layers=$(jq -n \
-    --argjson core "$(build_layer_json "core" "$core_total" "$core_checked" "$core_passed" "$core_failed" "$core_skipped" "$core_ai" "$core_warned" "$core_compliant")" \
-    --argjson recommended "$(build_layer_json "recommended" "$rec_total" "$rec_checked" "$rec_passed" "$rec_failed" "$rec_skipped" "$rec_ai" "$rec_warned" "$rec_compliant")" \
-    --argjson ecosystem "$(build_layer_json "ecosystem" "$eco_total" "$eco_checked" "$eco_passed" "$eco_failed" "$eco_skipped" "$eco_ai" "$eco_warned" "$eco_compliant")" \
+    --argjson core "$(build_layer_json "core" "$core_total" "$core_selected" "$core_checked" "$core_passed" "$core_failed" "$core_skipped" "$core_ai" "$core_warned" "$core_compliant_json" "$core_eligible")" \
+    --argjson recommended "$(build_layer_json "recommended" "$rec_total" "$rec_selected" "$rec_checked" "$rec_passed" "$rec_failed" "$rec_skipped" "$rec_ai" "$rec_warned" "$rec_compliant_json" "$rec_eligible")" \
+    --argjson ecosystem "$(build_layer_json "ecosystem" "$eco_total" "$eco_selected" "$eco_checked" "$eco_passed" "$eco_failed" "$eco_skipped" "$eco_ai" "$eco_warned" "$eco_compliant_json" "$eco_eligible")" \
     '[ $core, $recommended, $ecosystem ]')
 
   # Build dimensions array
@@ -2541,8 +2585,9 @@ build_report() {
     --arg spec "$SPEC_VERSION" \
     --arg ts "$timestamp" \
     --argjson summary "{\"total\": $total, \"passed\": $passed, \"failed\": $failed, \"skipped\": $skipped, \"ai_review\": $ai, \"warned\": $warned}" \
+    --argjson scope "{\"partial\": $partial, \"dimension\": $(printf '%s' "$ACTIVE_DIMENSION" | jq -Rs .), \"layer\": $(printf '%s' "$ACTIVE_LAYER" | jq -Rs .), \"priority\": $(printf '%s' "$ACTIVE_PRIORITY" | jq -Rs .), \"rule\": $(printf '%s' "$ACTIVE_RULE" | jq -Rs .)}" \
     --argjson layers "$layers" \
-    --argjson cert "{\"agent_friendly\": $agent_friendly, \"agent_ready\": $agent_ready, \"agent_native\": $agent_native}" \
+    --argjson cert "{\"eligible\": $certification_eligible, \"partial\": $partial, \"agent_friendly\": $agent_friendly_json, \"agent_ready\": $agent_ready_json, \"agent_native\": $agent_native_json, \"reason\": $(printf '%s' "$certification_reason" | jq -Rs .)}" \
     --argjson dims "$dimensions" \
     --argjson ai "$ai_checks" \
     '{
@@ -2550,6 +2595,7 @@ build_report() {
       version: $version,
       spec_version: $spec,
       timestamp: $ts,
+      scope: $scope,
       summary: $summary,
       layers: $layers,
       certification: $cert,
@@ -2589,6 +2635,11 @@ cmd_check() {
   [[ -n "$cli" ]] || error_json "MISSING_PARAM" \
     "Missing required parameter: target CLI command" \
     "Usage: agent-cli-lint check <cli> [--dimension 01] [--layer core] [--priority p0] [--rule O1]" 2
+
+  ACTIVE_DIMENSION="$dimension"
+  ACTIVE_LAYER="$layer"
+  ACTIVE_PRIORITY="$priority"
+  ACTIVE_RULE="$rule"
 
   ensure_dirs
   discover_target "$cli"
@@ -2633,15 +2684,11 @@ cmd_check() {
       echo "$report" | jq '.'
     fi
   else
-    local af ar an
+    local partial af ar an
+    partial=$(echo "$report" | jq -r '.scope.partial')
     af=$(echo "$report" | jq -r '.certification.agent_friendly')
     ar=$(echo "$report" | jq -r '.certification.agent_ready')
     an=$(echo "$report" | jq -r '.certification.agent_native')
-    local core_ok rec_ok eco_ok
-    core_ok=$(echo "$report" | jq -r '.layers[] | select(.name == "core") | .compliant')
-    rec_ok=$(echo "$report" | jq -r '.layers[] | select(.name == "recommended") | .compliant')
-    eco_ok=$(echo "$report" | jq -r '.layers[] | select(.name == "ecosystem") | .compliant')
-
     echo ""
     echo "  Agent-Friendly CLI Spec v$SPEC_VERSION — Lint Report"
     echo "  ─────────────────────────────────────────────"
@@ -2649,23 +2696,49 @@ cmd_check() {
     echo "  Passed:  $passed / $total"
     echo "  Failed:  $failed"
     echo "  Skipped: $skipped"
+    if [[ "$partial" == true ]]; then
+      echo "  Scope:   partial report"
+      echo "           filters: $(echo "$report" | jq -r '[.scope.dimension, .scope.layer, .scope.priority, .scope.rule] | map(select(. != "")) | if length == 0 then "none" else join(", ") end')"
+    fi
     echo ""
     echo "  Certification:"
-    [[ "$af" == true ]] && echo "    ✓ Agent-Friendly (core layer complete)" || echo "    ✗ Agent-Friendly"
-    [[ "$ar" == true ]] && echo "    ✓ Agent-Ready (core + recommended complete)" || echo "    ✗ Agent-Ready"
-    [[ "$an" == true ]] && echo "    ✓ Agent-Native (all layers complete)" || echo "    ✗ Agent-Native"
+    if [[ "$partial" == true ]]; then
+      echo "    not computed on filtered runs"
+    else
+      [[ "$af" == true ]] && echo "    ✓ Agent-Friendly (core layer complete)" || echo "    ✗ Agent-Friendly"
+      [[ "$ar" == true ]] && echo "    ✓ Agent-Ready (core + recommended complete)" || echo "    ✗ Agent-Ready"
+      [[ "$an" == true ]] && echo "    ✓ Agent-Native (all layers complete)" || echo "    ✗ Agent-Native"
+    fi
     echo ""
     echo "  Layers:"
-    [[ "$core_ok" == true ]] && echo "    ✓ core" || echo "    ✗ core"
-    [[ "$rec_ok" == true ]] && echo "    ✓ recommended" || echo "    ✗ recommended"
-    [[ "$eco_ok" == true ]] && echo "    ✓ ecosystem" || echo "    ✗ ecosystem"
+    for lname in core recommended ecosystem; do
+      local leligible lcompliant lsummary lselected
+      leligible=$(echo "$report" | jq -r --arg lname "$lname" '.layers[] | select(.name == $lname) | .eligible')
+      lcompliant=$(echo "$report" | jq -r --arg lname "$lname" '.layers[] | select(.name == $lname) | .compliant')
+      lselected=$(echo "$report" | jq -r --arg lname "$lname" '.layers[] | select(.name == $lname) | .summary.selected')
+      lsummary=$(echo "$report" | jq -r --arg lname "$lname" '.layers[] | select(.name == $lname) | "\(.summary.passed)/\(.summary.checked) passed, \(.summary.failed) failed, \(.summary.skipped) skipped"')
+      if [[ "$leligible" == true ]]; then
+        [[ "$lcompliant" == true ]] && echo "    ✓ $lname ($lsummary)" || echo "    ✗ $lname ($lsummary)"
+      elif [[ "${lselected:-0}" -gt 0 ]]; then
+        echo "    · $lname (partial: $lsummary)"
+      else
+        echo "    · $lname (not in scope)"
+      fi
+    done
     echo ""
 
     # Show failures
     if [[ "$failed" -gt 0 ]]; then
       echo "  Failures:"
-      echo "$report" | jq -r '.dimensions[].rules[] | select(.status == "fail") |
-        "    [\(.priority)] \(.id) \(.name): \(.detail)"'
+      for lname in core recommended ecosystem; do
+        local layer_failures
+        layer_failures=$(echo "$report" | jq -r --arg lname "$lname" '
+          [.dimensions[].rules[] | select(.status == "fail" and .layer == $lname) |
+            "    [\(.priority)] \(.id) \(.name): \(.detail)"] | .[]?')
+        [[ -z "$layer_failures" ]] && continue
+        echo "    $lname:"
+        echo "$layer_failures"
+      done
       echo ""
     fi
   fi
