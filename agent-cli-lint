@@ -114,8 +114,72 @@ filter_fields() {
   fi
 }
 
+agent_issue_guide() {
+  printf '%s' "Any problem, bad output, or confusion — run: agent-cli-lint issue create --type <bug|requirement|suggestion|bad-output> --message '...'"
+}
+
+read_frontmatter_description() {
+  local file="$1"
+  awk '
+    BEGIN { in_fm = 0 }
+    NR == 1 && $0 == "---" { in_fm = 1; next }
+    in_fm && $0 == "---" { exit }
+    in_fm && $0 ~ /^description:[[:space:]]*/ {
+      sub(/^description:[[:space:]]*/, "", $0)
+      print $0
+      exit
+    }
+  ' "$file"
+}
+
+agent_rules_json() {
+  local rules=()
+  if [[ -d "$SCRIPT_DIR/agent/rules" ]]; then
+    for f in "$SCRIPT_DIR/agent/rules"/*.md; do
+      [[ -f "$f" ]] || continue
+      local name; name=$(basename "$f" .md)
+      local content; content=$(cat "$f")
+      rules+=("{\"name\": $(printf '%s' "$name" | jq -Rs .), \"content\": $(printf '%s' "$content" | jq -Rs .)}")
+    done
+  fi
+  local rules_json; rules_json=$(IFS=','; echo "[${rules[*]:-}]")
+  echo "$rules_json"
+}
+
+agent_skills_json() {
+  local skills=()
+  if [[ -d "$SCRIPT_DIR/agent/skills" ]]; then
+    for f in "$SCRIPT_DIR/agent/skills"/*.md; do
+      [[ -f "$f" ]] || continue
+      local name description
+      name=$(basename "$f" .md)
+      description=$(read_frontmatter_description "$f")
+      skills+=("{\"name\": $(printf '%s' "$name" | jq -Rs .), \"description\": $(printf '%s' "$description" | jq -Rs .), \"command\": $(printf 'agent-cli-lint skills %s' "$name" | jq -Rs .)}")
+    done
+  fi
+  local skills_json; skills_json=$(IFS=','; echo "[${skills[*]:-}]")
+  echo "$skills_json"
+}
+
+attach_agent_context() {
+  local data="$1"
+  local rules_json skills_json issue_text
+  rules_json=$(agent_rules_json)
+  skills_json=$(agent_skills_json)
+  issue_text=$(agent_issue_guide)
+  echo "$data" | jq \
+    --argjson rules "$rules_json" \
+    --argjson skills "$skills_json" \
+    --arg issue "$issue_text" \
+    'if type == "array"
+     then {result: ., rules: $rules, skills: $skills, issue: $issue}
+     else . + {rules: $rules, skills: $skills, issue: $issue}
+     end'
+}
+
 output_json() {
   local data="$1"
+  data=$(attach_agent_context "$data")
   if [[ -n "$FIELDS" ]]; then
     echo "$data" | filter_fields
   else
@@ -126,8 +190,9 @@ output_json() {
 output_list() {
   local data="$1"
   if wants_json_output; then
+    data=$(attach_agent_context "$data")
     if [[ -n "$FIELDS" ]]; then
-      echo "$data" | jq "[.[] | {$(echo "$FIELDS" | sed 's/\([^,]*\)/"\1": .\1/g')}]"
+      echo "$data" | filter_fields
     else
       echo "$data" | jq '.'
     fi
@@ -166,7 +231,8 @@ cmd_help() {
   local rules_json; rules_json=$(IFS=','; echo "[${rules[*]:-}]")
   local skills_json; skills_json=$(IFS=','; echo "[${skills[*]:-}]")
 
-  jq -n \
+  local help_json
+  help_json=$(jq -n \
     --arg help "$brief" \
     --argjson rules "$rules_json" \
     --argjson skills "$skills_json" \
@@ -189,7 +255,8 @@ cmd_help() {
       rules: $rules,
       skills: $skills,
       issue: "Any problem, bad output, or confusion — run: agent-cli-lint issue create --type <bug|requirement|suggestion|bad-output> --message '\''...'\''",
-    }'
+    }')
+  output_json "$help_json"
 }
 
 cmd_brief() {
@@ -201,7 +268,8 @@ cmd_brief() {
 }
 
 cmd_describe() {
-  cat <<'SCHEMA'
+  local describe_json
+  describe_json=$(cat <<'SCHEMA'
 {
   "name": "agent-cli-lint",
   "version": "0.1.0",
@@ -273,22 +341,14 @@ cmd_describe() {
   }
 }
 SCHEMA
+)
+  output_json "$describe_json"
 }
 
 cmd_skills() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    # List all skills
-    local skills=()
-    if [[ -d "$SCRIPT_DIR/agent/skills" ]]; then
-      for f in "$SCRIPT_DIR/agent/skills"/*.md; do
-        [[ -f "$f" ]] || continue
-        local sname; sname=$(basename "$f" .md)
-        skills+=("{\"name\": $(printf '%s' "$sname" | jq -Rs .), \"command\": \"agent-cli-lint skills $sname\"}")
-      done
-    fi
-    local skills_json; skills_json=$(IFS=','; echo "[${skills[*]:-}]")
-    echo "$skills_json" | jq '.'
+    output_json "$(agent_skills_json)"
     return
   fi
 
@@ -299,23 +359,16 @@ cmd_skills() {
       "Available: $(ls "$SCRIPT_DIR/agent/skills/" 2>/dev/null | sed 's/.md$//' | paste -sd', ')" 20
   fi
 
-  local rules=()
-  if [[ -d "$SCRIPT_DIR/agent/rules" ]]; then
-    for f in "$SCRIPT_DIR/agent/rules"/*.md; do
-      [[ -f "$f" ]] || continue
-      local rname; rname=$(basename "$f" .md)
-      local rcontent; rcontent=$(cat "$f")
-      rules+=("{\"name\": $(printf '%s' "$rname" | jq -Rs .), \"content\": $(printf '%s' "$rcontent" | jq -Rs .)}")
-    done
-  fi
-  local rules_json; rules_json=$(IFS=','; echo "[${rules[*]:-}]")
+  local description; description=$(read_frontmatter_description "$skill_file")
   local content; content=$(cat "$skill_file")
 
-  jq -n \
+  local skill_json
+  skill_json=$(jq -n \
     --arg name "$name" \
+    --arg description "$description" \
     --arg content "$content" \
-    --argjson rules "$rules_json" \
-    '{name: $name, content: $content, rules: $rules}'
+    '{name: $name, description: $description, content: $content}')
+  output_json "$skill_json"
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -358,7 +411,7 @@ cmd_issue_create() {
     '{id:$id, type:$type, message:$message, version:$version, status:$status, created:$created, created_at:$created, updated_at:$updated}')
   echo "$issue" > "$ISSUES_DIR/$id.json"
   log "Issue created: $id"
-  if wants_json_output; then echo "$issue" | jq '.'; fi
+  if wants_json_output; then output_json "$issue"; fi
 }
 
 cmd_issue_list() {
@@ -2285,12 +2338,19 @@ check_F8() {
     return
   fi
   # Check each issue in list has a status field
-  local count; count=$(echo "$RUN_STDOUT" | jq 'if type == "array" then length else 0 end' 2>/dev/null)
+  local count; count=$(echo "$RUN_STDOUT" | jq '
+    if type == "array" then length
+    elif .result? | type == "array" then .result | length
+    else 0 end' 2>/dev/null)
   if [[ "${count:-0}" -eq 0 ]]; then
     emit_result "F8" "skip" "No issues found to verify status field"
     return
   fi
-  local without_status; without_status=$(echo "$RUN_STDOUT" | jq '[.[] | select(.status == null)] | length' 2>/dev/null)
+  local without_status; without_status=$(echo "$RUN_STDOUT" | jq '
+    if type == "array" then .
+    elif .result? | type == "array" then .result
+    else [] end
+    | [.[] | select(.status == null)] | length' 2>/dev/null)
   if [[ "${without_status:-0}" -eq 0 ]]; then
     emit_result "F8" "pass" "All $count issues have status field"
   else
@@ -2746,11 +2806,7 @@ cmd_check() {
   total=$(echo "$report" | jq -r '.summary.total')
 
   if wants_json_output; then
-    if [[ -n "$FIELDS" ]]; then
-      echo "$report" | filter_fields
-    else
-      echo "$report" | jq '.'
-    fi
+    output_json "$report"
   else
     local partial af ar an
     partial=$(echo "$report" | jq -r '.scope.partial')
@@ -2835,7 +2891,7 @@ cmd_snapshot() {
   log "Snapshot saved: $snap_dir/schema.json"
 
   if wants_json_output; then
-    jq -n --arg dir "$snap_dir" --arg tool "$tool_name" '{snapshot: $dir, tool: $tool}'
+    output_json "$(jq -n --arg dir "$snap_dir" --arg tool "$tool_name" '{snapshot: $dir, tool: $tool}')"
   fi
 }
 
@@ -2865,8 +2921,8 @@ cmd_diff() {
   [[ -n "$removed" ]] && breaking=true
 
   if wants_json_output; then
-    jq -n --arg added "$added" --arg removed "$removed" --argjson breaking "$breaking" \
-      '{added: $added, removed: $removed, breaking: $breaking}'
+    output_json "$(jq -n --arg added "$added" --arg removed "$removed" --argjson breaking "$breaking" \
+      '{added: $added, removed: $removed, breaking: $breaking}')"
   else
     echo "  Snapshot diff for $tool_name:"
     [[ -n "$added" ]]   && echo "    Added:   $added"
@@ -2894,7 +2950,7 @@ cmd_ai_prompts() {
   local grep_update="grep -riE '(auto.?update|self.?update|check.?update|fetch.*latest|upgrade.*silent)' $src_dir --include='*.ts' --include='*.sh' --include='*.py' --include='*.js' 2>/dev/null || echo 'NONE'"
   local grep_errors="grep -rn '(catch|rescue|except|trap|\.catch\(|try {)' $src_dir --include='*.ts' --include='*.sh' --include='*.py' --include='*.js' 2>/dev/null | head -20 || true"
 
-  jq -n \
+  output_json "$(jq -n \
     --arg cli "$cli" \
     --arg test_cmd "$test_cmd" \
     --arg cmds "$all_cmds" \
@@ -2969,7 +3025,7 @@ cmd_ai_prompts() {
         pass_if: "Guard errors cause rejection (exit non-zero with error JSON)",
         fail_if: "Guard errors swallowed, command proceeds anyway"
       }
-    ]'
+    ]')"
 }
 
 # ═══════════════════════════════════════════════════════════
