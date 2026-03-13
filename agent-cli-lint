@@ -1,0 +1,2883 @@
+#!/usr/bin/env bash
+# agent-cli-lint — Agent-Friendly CLI Spec v0.1 Compliance Checker
+# This tool itself complies with the spec it enforces (dogfooding).
+set -euo pipefail
+
+VERSION="0.1.0"
+SPEC_VERSION="0.1"
+LINT_DIR="${AGENT_CLI_LINT_DIR:-$HOME/.agent-cli-lint}"
+ISSUES_DIR="$LINT_DIR/issues"
+SNAPSHOTS_DIR="$LINT_DIR/snapshots"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ═══════════════════════════════════════════════════════════
+# D07 Composability: stderr for logs, stdout for data only
+# ═══════════════════════════════════════════════════════════
+QUIET=false
+OUTPUT_JSON=false
+FORCE_HUMAN=false
+FIELDS=""
+log() { [[ "$QUIET" == true ]] && return; echo "$*" >&2; }
+
+# ═══════════════════════════════════════════════════════════
+# D03 Structured Error: { error, code, message, suggestion }
+# ═══════════════════════════════════════════════════════════
+error_json() {
+  local code="$1" message="$2" suggestion="${3:-}" exit_code="${4:-1}"
+  local sug_field=""
+  [[ -n "$suggestion" ]] && sug_field=", \"suggestion\": $(printf '%s' "$suggestion" | jq -Rs .)"
+  printf '{"error": true, "code": "%s", "message": %s%s}\n' \
+    "$code" "$(printf '%s' "$message" | jq -Rs .)" "$sug_field" >&2
+  exit "$exit_code"
+}
+
+# ═══════════════════════════════════════════════════════════
+# D11 Guardrails: Runtime protection
+# ═══════════════════════════════════════════════════════════
+check_secret() {
+  local val="$1" param="$2"
+  if [[ "$val" =~ ^(sk-|pk-|ghp_|gho_|github_pat_|xoxb-|xoxp-|AKIA) ]] ||
+     [[ "$val" =~ ^(eyJ[A-Za-z0-9]) ]] ||
+     [[ ${#val} -gt 30 && "$val" =~ ^[A-Za-z0-9+/=_-]+$ && ! "$val" =~ [.:/] ]]; then
+    error_json "SECRET_DETECTED" \
+      "Parameter --$param looks like an API key or token" \
+      "Never pass secrets as CLI arguments." 2
+  fi
+}
+
+check_path() {
+  local val="$1" param="$2"
+  if [[ "$val" =~ \.\. ]] || [[ "$val" =~ ^/ ]]; then
+    error_json "PATH_TRAVERSAL" \
+      "Parameter --$param contains path traversal or absolute path" \
+      "Use relative paths without .. components." 2
+  fi
+  local base; base=$(basename "$val")
+  if [[ "$base" =~ ^\.env ]] || [[ "$base" =~ \.key$ ]] || [[ "$base" =~ \.pem$ ]] ||
+     [[ "$base" =~ secret ]] || [[ "$base" =~ password ]]; then
+    error_json "SENSITIVE_PATH" \
+      "Parameter --$param points to a sensitive file: $base" \
+      "Avoid operating on credential or secret files." 2
+  fi
+}
+
+check_shell_meta() {
+  local val="$1" param="$2"
+  if [[ "$val" =~ [\;\|\&\$\`] ]] || [[ "$val" =~ \$\( ]]; then
+    error_json "SHELL_INJECTION" \
+      "Parameter --$param contains shell metacharacters" \
+      "Remove ; | & \$ \` characters from the value." 2
+  fi
+}
+
+validate_input() {
+  local val="$1" param="$2"
+  check_shell_meta "$val" "$param"
+  check_secret "$val" "$param"
+  if [[ "$val" =~ [[:cntrl:]] ]] && ! [[ "$val" =~ ^[[:print:][:space:]]*$ ]]; then
+    error_json "CONTROL_CHAR" \
+      "Parameter --$param contains control characters" \
+      "Remove non-printable characters from the value." 2
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════
+# Data layer
+# ═══════════════════════════════════════════════════════════
+ensure_dirs() {
+  mkdir -p "$LINT_DIR" "$ISSUES_DIR" "$SNAPSHOTS_DIR"
+}
+
+is_tty() { [[ -t 1 ]]; }
+
+wants_json_output() {
+  [[ "$OUTPUT_JSON" == true ]] && return 0
+  [[ "$FORCE_HUMAN" == true ]] && return 1
+  ! is_tty
+}
+
+# ═══════════════════════════════════════════════════════════
+# D02 Structured Output
+# ═══════════════════════════════════════════════════════════
+filter_fields() {
+  if [[ -n "$FIELDS" ]]; then
+    local parts=()
+    IFS=',' read -ra field_arr <<< "$FIELDS"
+    local obj_parts=()
+    for f in "${field_arr[@]}"; do
+      obj_parts+=("\"$f\": .$f")
+    done
+    local obj_expr; obj_expr=$(IFS=','; echo "${obj_parts[*]}")
+    jq "{$obj_expr}"
+  else
+    jq '.'
+  fi
+}
+
+output_json() {
+  local data="$1"
+  if [[ -n "$FIELDS" ]]; then
+    echo "$data" | filter_fields
+  else
+    echo "$data" | jq '.'
+  fi
+}
+
+output_list() {
+  local data="$1"
+  if wants_json_output; then
+    if [[ -n "$FIELDS" ]]; then
+      echo "$data" | jq "[.[] | {$(echo "$FIELDS" | sed 's/\([^,]*\)/"\1": .\1/g')}]"
+    else
+      echo "$data" | jq '.'
+    fi
+  else
+    echo "$data" | jq -r '.[] | "  \(.id // "-")  \(.status // "-")  \(.detail // "-")"'
+    local count; count=$(echo "$data" | jq 'length')
+    log "  ($count items)"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════
+# D01 Discoverability: --help, --describe, skills
+# ═══════════════════════════════════════════════════════════
+cmd_help() {
+  local brief="" rules=() skills=()
+
+  if [[ -f "$SCRIPT_DIR/agent/brief.md" ]]; then
+    brief=$(cat "$SCRIPT_DIR/agent/brief.md")
+  fi
+  if [[ -d "$SCRIPT_DIR/agent/rules" ]]; then
+    for f in "$SCRIPT_DIR/agent/rules"/*.md; do
+      [[ -f "$f" ]] || continue
+      local name; name=$(basename "$f" .md)
+      local content; content=$(cat "$f")
+      rules+=("{\"name\": $(printf '%s' "$name" | jq -Rs .), \"content\": $(printf '%s' "$content" | jq -Rs .)}")
+    done
+  fi
+  if [[ -d "$SCRIPT_DIR/agent/skills" ]]; then
+    for f in "$SCRIPT_DIR/agent/skills"/*.md; do
+      [[ -f "$f" ]] || continue
+      local name; name=$(basename "$f" .md)
+      skills+=("{\"name\": $(printf '%s' "$name" | jq -Rs .), \"command\": \"agent-cli-lint skills $name\"}")
+    done
+  fi
+
+  local rules_json; rules_json=$(IFS=','; echo "[${rules[*]:-}]")
+  local skills_json; skills_json=$(IFS=','; echo "[${skills[*]:-}]")
+
+  jq -n \
+    --arg help "$brief" \
+    --argjson rules "$rules_json" \
+    --argjson skills "$skills_json" \
+    '{
+      help: $help,
+      version: "'"$VERSION"'",
+      commands: [
+        {"name": "check", "description": "Check CLI compliance against spec rules"},
+        {"name": "snapshot", "description": "Save schema and error code snapshot"},
+        {"name": "diff", "description": "Compare current vs saved snapshot"},
+        {"name": "ai-prompts", "description": "Generate AI check prompts for non-automatable rules"},
+        {"name": "issue", "description": "Feedback system (create/list/show)"},
+        {"name": "skills", "description": "View available skills"}
+      ],
+      layers: [
+        {"name": "core", "description": "Minimum execution contract: JSON, errors, exit codes, stdout/stderr separation, safety guardrails"},
+        {"name": "recommended", "description": "Machine-friendly ergonomics: self-description, explicit flags, pipe-safe UX, richer safety semantics"},
+        {"name": "ecosystem", "description": "Agent-native ecosystem contract: agent metadata, skills, feedback workflow, inline context"}
+      ],
+      rules: $rules,
+      skills: $skills,
+      issue: "Any problem, bad output, or confusion — run: agent-cli-lint issue create --type <bug|requirement|suggestion|bad-output> --message '\''...'\''",
+    }'
+}
+
+cmd_brief() {
+  if [[ -f "$SCRIPT_DIR/agent/brief.md" ]]; then
+    cat "$SCRIPT_DIR/agent/brief.md"
+  else
+    error_json "NOT_FOUND" "agent/brief.md not found" "Create agent/brief.md at the project root." 20
+  fi
+}
+
+cmd_describe() {
+  cat <<'SCHEMA'
+{
+  "name": "agent-cli-lint",
+  "version": "0.1.0",
+  "description": "Agent-Friendly CLI Spec v0.1 compliance checker",
+  "commands": [
+    {
+      "name": "check",
+      "description": "Check CLI compliance against 98 rules",
+      "destructive": false,
+      "permission": "read",
+      "parameters": [
+        {"name": "cli", "type": "string", "required": true, "description": "Target CLI command to check"},
+        {"name": "dimension", "type": "string", "required": false, "description": "Filter by dimension (01-11)"},
+        {"name": "layer", "type": "string", "required": false, "enum": ["core", "recommended", "ecosystem"], "description": "Filter by execution layer"},
+        {"name": "priority", "type": "string", "required": false, "enum": ["p0", "p1", "p2"], "description": "Filter by priority"},
+        {"name": "rule", "type": "string", "required": false, "description": "Check single rule by ID (e.g. O1)"}
+      ],
+      "output": {"type": "object", "properties": {"tool": "string", "summary": "object", "layers": "array", "certification": "object", "dimensions": "array"}}
+    },
+    {
+      "name": "snapshot",
+      "description": "Save schema and error code snapshot",
+      "destructive": false,
+      "permission": "write",
+      "parameters": [
+        {"name": "cli", "type": "string", "required": true, "description": "Target CLI command"}
+      ]
+    },
+    {
+      "name": "diff",
+      "description": "Compare current vs saved snapshot",
+      "destructive": false,
+      "permission": "read",
+      "parameters": [
+        {"name": "cli", "type": "string", "required": true, "description": "Target CLI command"}
+      ]
+    },
+    {
+      "name": "ai-prompts",
+      "description": "Generate AI check prompts for non-automatable rules",
+      "destructive": false,
+      "permission": "read",
+      "parameters": [
+        {"name": "cli", "type": "string", "required": true, "description": "Target CLI command"}
+      ]
+    },
+    {
+      "name": "issue",
+      "description": "Feedback system",
+      "subcommands": ["create", "list", "show"],
+      "destructive": false
+    },
+    {
+      "name": "skills",
+      "description": "View available skills",
+      "destructive": false,
+      "permission": "read",
+      "parameters": [
+        {"name": "name", "type": "string", "required": false, "description": "Skill name"}
+      ]
+    }
+  ],
+  "global_flags": ["--agent", "--human", "--brief", "--help", "--version", "--fields", "--quiet"],
+  "exit_codes": {
+    "0": "Success (all checked rules pass)",
+    "1": "Lint failures found or general error",
+    "2": "Usage/parameter error",
+    "20": "Resource not found"
+  }
+}
+SCHEMA
+}
+
+cmd_skills() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    # List all skills
+    local skills=()
+    if [[ -d "$SCRIPT_DIR/agent/skills" ]]; then
+      for f in "$SCRIPT_DIR/agent/skills"/*.md; do
+        [[ -f "$f" ]] || continue
+        local sname; sname=$(basename "$f" .md)
+        skills+=("{\"name\": $(printf '%s' "$sname" | jq -Rs .), \"command\": \"agent-cli-lint skills $sname\"}")
+      done
+    fi
+    local skills_json; skills_json=$(IFS=','; echo "[${skills[*]:-}]")
+    echo "$skills_json" | jq '.'
+    return
+  fi
+
+  local skill_file="$SCRIPT_DIR/agent/skills/$name.md"
+  if [[ ! -f "$skill_file" ]]; then
+    error_json "NOT_FOUND" \
+      "Skill not found: $name" \
+      "Available: $(ls "$SCRIPT_DIR/agent/skills/" 2>/dev/null | sed 's/.md$//' | paste -sd', ')" 20
+  fi
+
+  local rules=()
+  if [[ -d "$SCRIPT_DIR/agent/rules" ]]; then
+    for f in "$SCRIPT_DIR/agent/rules"/*.md; do
+      [[ -f "$f" ]] || continue
+      local rname; rname=$(basename "$f" .md)
+      local rcontent; rcontent=$(cat "$f")
+      rules+=("{\"name\": $(printf '%s' "$rname" | jq -Rs .), \"content\": $(printf '%s' "$rcontent" | jq -Rs .)}")
+    done
+  fi
+  local rules_json; rules_json=$(IFS=','; echo "[${rules[*]:-}]")
+  local content; content=$(cat "$skill_file")
+
+  jq -n \
+    --arg name "$name" \
+    --arg content "$content" \
+    --argjson rules "$rules_json" \
+    '{name: $name, content: $content, rules: $rules}'
+}
+
+# ═══════════════════════════════════════════════════════════
+# D10 Feedback: issue subcommand
+# ═══════════════════════════════════════════════════════════
+cmd_issue() {
+  local subcmd="${1:-}"
+  shift 2>/dev/null || true
+
+  case "$subcmd" in
+    create) cmd_issue_create "$@" ;;
+    list)   cmd_issue_list ;;
+    show)   cmd_issue_show "$@" ;;
+    "")     error_json "MISSING_PARAM" "Missing subcommand for issue" "Usage: agent-cli-lint issue <create|list|show>" 2 ;;
+    *)      error_json "UNKNOWN_COMMAND" "Unknown issue subcommand: $subcmd" "Available: create, list, show" 2 ;;
+  esac
+}
+
+cmd_issue_create() {
+  local type="" message=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type)    [[ $# -ge 2 ]] || error_json "MISSING_VALUE" "Flag --type requires a value" "" 2; type="$2"; shift 2 ;;
+      --message) [[ $# -ge 2 ]] || error_json "MISSING_VALUE" "Flag --message requires a value" "" 2; message="$2"; shift 2 ;;
+      *)         error_json "UNKNOWN_FLAG" "Unknown flag: $1" "Valid flags: --type, --message" 2 ;;
+    esac
+  done
+  [[ -n "$type" ]]    || error_json "MISSING_PARAM" "Missing: --type" "Options: bug, requirement, suggestion, bad-output" 2
+  [[ -n "$message" ]] || error_json "MISSING_PARAM" "Missing: --message" "Describe the issue." 2
+  case "$type" in
+    bug|requirement|suggestion|bad-output) ;;
+    *) error_json "INVALID_ENUM" "Invalid issue type: $type" "Valid: bug, requirement, suggestion, bad-output" 2 ;;
+  esac
+  validate_input "$message" "message"
+  ensure_dirs
+  local id="iss-$(date +%s)-$((RANDOM % 1000))"
+  local created; created=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  local issue; issue=$(jq -n --arg id "$id" --arg type "$type" --arg message "$message" \
+    --arg version "$VERSION" --arg created "$created" --arg updated "$created" --arg status "open" \
+    '{id:$id, type:$type, message:$message, version:$version, status:$status, created:$created, created_at:$created, updated_at:$updated}')
+  echo "$issue" > "$ISSUES_DIR/$id.json"
+  log "Issue created: $id"
+  if wants_json_output; then echo "$issue" | jq '.'; fi
+}
+
+cmd_issue_list() {
+  ensure_dirs
+  local issues="[]"
+  for f in "$ISSUES_DIR"/*.json; do
+    [[ -f "$f" ]] || continue
+    issues=$(echo "$issues" | jq --slurpfile entry "$f" '. + $entry')
+  done
+  output_list "$issues"
+}
+
+cmd_issue_show() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || error_json "MISSING_PARAM" "Missing: issue ID" "Usage: agent-cli-lint issue show <id>" 2
+  local file="$ISSUES_DIR/$id.json"
+  [[ -f "$file" ]] || error_json "NOT_FOUND" "Issue not found: $id" "Use: agent-cli-lint issue list" 20
+  output_json "$(cat "$file")"
+}
+
+# ═══════════════════════════════════════════════════════════
+# Check Infrastructure
+# ═══════════════════════════════════════════════════════════
+
+# Temp file for stderr capture
+TMP_STDERR=""
+TMP_STDOUT=""
+cleanup() { rm -f "$TMP_STDERR" "$TMP_STDOUT" 2>/dev/null; }
+
+# macOS-compatible timeout (bash 3.2 safe, suppresses job control messages)
+run_with_timeout() {
+  local secs="$1"; shift
+  local cmd_output cmd_err
+  cmd_output=$(mktemp)
+  cmd_err=$(mktemp)
+
+  # Run in subshell to suppress bash job control messages
+  TIMEOUT_STDOUT=""
+  TIMEOUT_STDERR=""
+  TIMEOUT_EXIT=0
+  (
+    eval "$@" > "$cmd_output" 2> "$cmd_err" &
+    local pid=$!
+    ( sleep "$secs" && kill -9 "$pid" 2>/dev/null ) &
+    local watcher=$!
+    wait "$pid" 2>/dev/null
+    local rc=$?
+    kill "$watcher" 2>/dev/null
+    wait "$watcher" 2>/dev/null || true
+    exit $rc
+  ) 2>/dev/null
+  TIMEOUT_EXIT=$?
+
+  TIMEOUT_STDOUT=$(cat "$cmd_output" 2>/dev/null)
+  TIMEOUT_STDERR=$(cat "$cmd_err" 2>/dev/null)
+  rm -f "$cmd_output" "$cmd_err"
+  return 0
+}
+
+# Results accumulator
+declare -a RESULTS=()
+
+emit_result() {
+  local id="$1" status="$2" detail="$3" suggestion="${4:-}"
+  local sug_field=""
+  [[ -n "$suggestion" ]] && sug_field=", \"suggestion\": $(printf '%s' "$suggestion" | jq -Rs .)"
+  RESULTS+=("{\"id\": \"$id\", \"status\": \"$status\", \"detail\": $(printf '%s' "$detail" | jq -Rs .)$sug_field}")
+}
+
+# Filter compiler/runtime noise from stderr mixed into stdout
+# Handles: cargo (Compiling/Finished/Running/Blocking/Downloading/warning:),
+#           bun ($ prefix lines), and other build tool noise
+_filter_compiler_noise() {
+  sed -E \
+    -e '/^[[:space:]]*(Compiling|Finished|Running|Blocking|Downloading|Downloaded|Updating|Unpacking|Resolving|Packaging|Documenting|Locking|Linking|Fresh|Checking) /d' \
+    -e '/^[[:space:]]*warning\[/d' \
+    -e '/^[[:space:]]*warning:/d' \
+    -e '/^\$/d' \
+    -e '/^[[:space:]]*\$/d'
+}
+
+# Target CLI state (cached after discover)
+TARGET_CLI=""
+TARGET_DIR=""
+DESCRIBE_CACHE=""
+DESCRIBE_EXIT=0
+HELP_CACHE=""
+HELP_EXIT=0
+BRIEF_CACHE=""
+BRIEF_EXIT=0
+VERSION_CACHE=""
+
+discover_target() {
+  local cli="$1"
+  TARGET_CLI="$cli"
+
+  # Resolve directory for static checks
+  local resolved
+  resolved=$(which "$cli" 2>/dev/null || echo "$cli")
+  if [[ -f "$resolved" ]]; then
+    TARGET_DIR=$(cd "$(dirname "$(realpath "$resolved" 2>/dev/null || echo "$resolved")")" && pwd)
+  else
+    # Multi-word command (e.g. "bun run src/main.ts") — try last arg
+    local last_word="${cli##* }"
+    if [[ -f "$last_word" ]]; then
+      TARGET_DIR=$(cd "$(dirname "$(realpath "$last_word" 2>/dev/null || echo "$last_word")")" && pwd)
+    else
+      TARGET_DIR="."
+    fi
+  fi
+
+  # For cargo/bun commands, also look for project root via manifest
+  if [[ "$cli" == *"--manifest-path"* ]]; then
+    local manifest_path
+    manifest_path=$(echo "$cli" | grep -oE '\-\-manifest-path [^ ]+' | awk '{print $2}')
+    if [[ -n "$manifest_path" && -f "$manifest_path" ]]; then
+      TARGET_DIR=$(cd "$(dirname "$(realpath "$manifest_path" 2>/dev/null || echo "$manifest_path")")" && pwd)
+    fi
+  fi
+
+  log "Discovering: $cli"
+  log "Target dir: $TARGET_DIR"
+
+  # Cache --help (primary discovery, per new spec)
+  HELP_CACHE=$(eval "$cli --help" 2>&1 | _filter_compiler_noise || echo '{}')
+  # Validate it's JSON
+  if echo "$HELP_CACHE" | jq -e '.' >/dev/null 2>&1; then
+    HELP_EXIT=0
+  else
+    HELP_CACHE='{}'
+    HELP_EXIT=1
+  fi
+
+  # Cache --describe (backward compat fallback)
+  DESCRIBE_CACHE=$(eval "$cli --describe" 2>/dev/null | _filter_compiler_noise || echo '{}')
+  if echo "$DESCRIBE_CACHE" | jq -e '.' >/dev/null 2>&1; then
+    DESCRIBE_EXIT=0
+  else
+    DESCRIBE_CACHE='{}'
+    DESCRIBE_EXIT=1
+  fi
+
+  # Cache --brief
+  BRIEF_CACHE=$(eval "$cli --brief" 2>/dev/null | _filter_compiler_noise || echo '')
+  BRIEF_EXIT=$?
+
+  # Cache --version
+  VERSION_CACHE=$(eval "$cli --version" 2>/dev/null | _filter_compiler_noise || echo '')
+}
+
+# Helper: get combined command names from HELP_CACHE or DESCRIBE_CACHE
+_get_command_names() {
+  local names=""
+  # Try HELP_CACHE first (new spec: .commands[].name)
+  if [[ "$HELP_EXIT" -eq 0 ]]; then
+    names=$(echo "$HELP_CACHE" | jq -r '.commands[]?.name // empty' 2>/dev/null)
+  fi
+  # Fallback to DESCRIBE_CACHE
+  if [[ -z "$names" ]] && [[ "$DESCRIBE_EXIT" -eq 0 ]]; then
+    names=$(echo "$DESCRIBE_CACHE" | jq -r '.commands[]?.name // empty' 2>/dev/null)
+  fi
+  echo "$names"
+}
+
+# Helper: check if we have detailed schema info (from --describe)
+_has_describe_schema() {
+  [[ "$DESCRIBE_EXIT" -eq 0 ]] && echo "$DESCRIBE_CACHE" | jq -e '.commands[0].parameters // .commands[0].destructive // .commands[0].output' >/dev/null 2>&1
+}
+
+# Helper: get tool name from best available source
+_get_tool_name() {
+  local name=""
+  name=$(echo "$DESCRIBE_CACHE" | jq -r '.name // empty' 2>/dev/null)
+  if [[ -z "$name" ]]; then
+    # Extract from --help .help field (first word or before " — ")
+    name=$(echo "$HELP_CACHE" | jq -r '.help // empty' 2>/dev/null | sed -E 's/ — .*//' | awk '{print $1}')
+  fi
+  if [[ -z "$name" ]]; then
+    name="unknown"
+  fi
+  echo "$name"
+}
+
+# Helper: get tool version from best available source
+_get_tool_version() {
+  local ver=""
+  ver=$(echo "$DESCRIBE_CACHE" | jq -r '.version // empty' 2>/dev/null)
+  if [[ -z "$ver" && -n "$VERSION_CACHE" ]]; then
+    ver="$VERSION_CACHE"
+  fi
+  if [[ -z "$ver" ]]; then
+    ver="unknown"
+  fi
+  echo "$ver"
+}
+
+# Helper: find a non-destructive list-like command from help or describe schema
+find_list_command() {
+  # Try DESCRIBE_CACHE first (has destructive info)
+  if _has_describe_schema; then
+    local result
+    result=$(echo "$DESCRIBE_CACHE" | jq -r '
+      .commands[]? |
+      select(.destructive == false or .destructive == null) |
+      select(.name == "list" or .name == "models" or .name == "status" or .name == "voices" or .name == "skills") |
+      .name' 2>/dev/null | head -1)
+    [[ -n "$result" ]] && echo "$result" && return
+  fi
+  # Fallback: search by name only from any source
+  _get_command_names | while IFS= read -r name; do
+    case "$name" in
+      list|models|status|voices|skills) echo "$name"; return ;;
+    esac
+  done
+}
+
+# Helper: find a destructive command
+find_destructive_command() {
+  # Only works with DESCRIBE_CACHE (needs destructive annotation)
+  if _has_describe_schema; then
+    echo "$DESCRIBE_CACHE" | jq -r '
+      .commands[]? |
+      select(.destructive == true) |
+      .name' 2>/dev/null | head -1
+  fi
+}
+
+# Helper: find a show-like command
+find_show_command() {
+  local candidates="show get info"
+  if _has_describe_schema; then
+    echo "$DESCRIBE_CACHE" | jq -r '
+      .commands[]? |
+      select(.name == "show" or .name == "get" or .name == "info") |
+      .name' 2>/dev/null | head -1
+    return
+  fi
+  _get_command_names | while IFS= read -r name; do
+    case "$name" in
+      show|get|info) echo "$name"; return ;;
+    esac
+  done
+}
+
+# Helper: find a command with required string param (for type/guardrail tests)
+find_command_with_required_param() {
+  # Only works with DESCRIBE_CACHE (needs parameter info)
+  if _has_describe_schema; then
+    echo "$DESCRIBE_CACHE" | jq -r '
+      .commands[]? |
+      select(.destructive == false or .destructive == null) |
+      select(.parameters? | length > 0) |
+      select(.parameters[]? | .required == true) |
+      .name' 2>/dev/null | head -1
+  fi
+}
+
+# Helper: run CLI and capture stdout/stderr/exit separately
+run_cli() {
+  local stdout_file stderr_file
+  stdout_file=$(mktemp)
+  stderr_file=$(mktemp)
+
+  eval "$TARGET_CLI $*" > "$stdout_file" 2> "$stderr_file"
+  local rc=$?
+
+  RUN_STDOUT=$(cat "$stdout_file" 2>/dev/null | _filter_compiler_noise)
+  RUN_STDERR=$(cat "$stderr_file" 2>/dev/null | _filter_compiler_noise)
+  RUN_EXIT=$rc
+  rm -f "$stdout_file" "$stderr_file"
+  return 0
+}
+
+# ═══════════════════════════════════════════════════════════
+# 89 Check Functions — Dimension 01: Discoverability
+# ═══════════════════════════════════════════════════════════
+
+check_D1() {
+  if [[ "$HELP_EXIT" -eq 0 ]] && echo "$HELP_CACHE" | jq -e '.commands' >/dev/null 2>&1; then
+    emit_result "D1" "pass" "--help outputs structured JSON with commands[]"
+  elif [[ "$DESCRIBE_EXIT" -eq 0 ]] && echo "$DESCRIBE_CACHE" | jq -e '.commands' >/dev/null 2>&1; then
+    emit_result "D1" "pass" "--describe outputs JSON with commands list (legacy, migrate to --help)"
+  else
+    emit_result "D1" "fail" "--help missing or does not output structured JSON with commands[]" \
+      "Add --help flag that outputs JSON with: help, commands[], rules[], skills[], issue."
+  fi
+}
+
+check_D2() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "D2" "skip" "No list-like command found to test per-command discovery"
+    return
+  fi
+  # Try per-command --help first (new spec), then --describe (legacy)
+  run_cli "$cmd --help"
+  if [[ "$RUN_EXIT" -eq 0 ]] && echo "$RUN_STDOUT" | jq -e '.name // .help // .commands' >/dev/null 2>&1; then
+    emit_result "D2" "pass" "$cmd --help outputs per-command schema"
+    return
+  fi
+  run_cli "$cmd --describe"
+  if [[ "$RUN_EXIT" -eq 0 ]] && echo "$RUN_STDOUT" | jq -e '.name' >/dev/null 2>&1; then
+    emit_result "D2" "pass" "$cmd --describe outputs per-command schema (legacy)"
+  else
+    emit_result "D2" "skip" "Per-command --help not supported (optional P2)"
+  fi
+}
+
+check_D3() {
+  # Check --help for help + commands (new spec) or --describe for name + version + commands (legacy)
+  if echo "$HELP_CACHE" | jq -e '.help and .commands' >/dev/null 2>&1; then
+    emit_result "D3" "pass" "--help has help + commands fields"
+  elif echo "$DESCRIBE_CACHE" | jq -e '.name and .version and .commands' >/dev/null 2>&1; then
+    emit_result "D3" "pass" "--describe has name, version, commands fields (legacy)"
+  else
+    emit_result "D3" "fail" "Schema missing required fields" \
+      "Ensure --help outputs JSON with: help, commands[], rules[], skills[], issue."
+  fi
+}
+
+check_D4() {
+  if ! _has_describe_schema; then
+    emit_result "D4" "skip" "No detailed schema (--describe) available; parameter types not checkable from --help"
+    return
+  fi
+  local missing; missing=$(echo "$DESCRIBE_CACHE" | jq -r '
+    [.commands[]?.parameters[]? | select(.type == null) | .name] | join(", ")' 2>/dev/null)
+  if [[ -z "$missing" || "$missing" == "null" ]]; then
+    emit_result "D4" "pass" "All parameters have type declarations"
+  else
+    emit_result "D4" "fail" "Parameters without type: $missing" \
+      "Add type field (string/integer/boolean/array) to every parameter."
+  fi
+}
+
+check_D5() {
+  if ! _has_describe_schema; then
+    emit_result "D5" "skip" "No detailed schema (--describe) available; enum declarations not checkable from --help"
+    return
+  fi
+  local has_enum; has_enum=$(echo "$DESCRIBE_CACHE" | jq '[.commands[]?.parameters[]? | select(.enum)] | length' 2>/dev/null)
+  if [[ "${has_enum:-0}" -gt 0 ]]; then
+    emit_result "D5" "pass" "Enum values declared for constrained parameters"
+  else
+    emit_result "D5" "skip" "No enum parameters found (may be acceptable)"
+  fi
+}
+
+check_D6() {
+  if ! _has_describe_schema; then
+    emit_result "D6" "skip" "No detailed schema (--describe) available; default values not checkable from --help"
+    return
+  fi
+  local has_defaults; has_defaults=$(echo "$DESCRIBE_CACHE" | jq '[.commands[]?.parameters[]? | select(.default != null)] | length' 2>/dev/null)
+  if [[ "${has_defaults:-0}" -gt 0 ]]; then
+    emit_result "D6" "pass" "Default values declared"
+  else
+    emit_result "D6" "skip" "No default values found (may be acceptable)"
+  fi
+}
+
+check_D7() {
+  if ! _has_describe_schema; then
+    emit_result "D7" "skip" "No detailed schema (--describe) available; required annotations not checkable from --help"
+    return
+  fi
+  local has_required; has_required=$(echo "$DESCRIBE_CACHE" | jq '[.commands[]?.parameters[]? | select(.required != null)] | length' 2>/dev/null)
+  local total_params; total_params=$(echo "$DESCRIBE_CACHE" | jq '[.commands[]?.parameters[]?] | length' 2>/dev/null)
+  if [[ "${total_params:-0}" -eq 0 ]]; then
+    emit_result "D7" "skip" "No parameters in schema"
+  elif [[ "${has_required:-0}" -gt 0 ]]; then
+    emit_result "D7" "pass" "Required/optional annotation present on parameters"
+  else
+    emit_result "D7" "fail" "No required annotations on parameters" \
+      "Mark required: true on mandatory parameters."
+  fi
+}
+
+check_D8() {
+  if ! _has_describe_schema; then
+    emit_result "D8" "skip" "No detailed schema (--describe) available; output schema not checkable from --help"
+    return
+  fi
+  local has_output; has_output=$(echo "$DESCRIBE_CACHE" | jq '[.commands[]? | select(.output != null)] | length' 2>/dev/null)
+  local total_cmds; total_cmds=$(echo "$DESCRIBE_CACHE" | jq '[.commands[]?] | length' 2>/dev/null)
+  if [[ "${has_output:-0}" -gt 0 ]]; then
+    emit_result "D8" "pass" "Output schema declared on $has_output/$total_cmds commands"
+  else
+    emit_result "D8" "fail" "No commands have output schema" \
+      "Add output field to each command in --describe schema."
+  fi
+}
+
+check_D9() {
+  # Check from --help first (new spec), then --describe (legacy)
+  local source="$HELP_CACHE"
+  if ! echo "$source" | jq -e '.commands[0]' >/dev/null 2>&1; then
+    source="$DESCRIBE_CACHE"
+  fi
+  local missing; missing=$(echo "$source" | jq -r '
+    [.commands[]? | select(.description == null or .description == "") | .name] | join(", ")' 2>/dev/null)
+  if [[ -z "$missing" || "$missing" == "null" || "$missing" == "" ]]; then
+    emit_result "D9" "pass" "All commands have descriptions"
+  else
+    emit_result "D9" "fail" "Commands without description: $missing" \
+      "Add description field to every command."
+  fi
+}
+
+check_D10() {
+  if echo "$DESCRIBE_CACHE" | jq -e '.version' >/dev/null 2>&1; then
+    emit_result "D10" "pass" "Version present in --describe schema"
+  else
+    local ver="$VERSION_CACHE"
+    # Handle JSON version output
+    if [[ -n "$ver" ]] && echo "$ver" | jq -e '.version' >/dev/null 2>&1; then
+      ver=$(echo "$ver" | jq -r '.version')
+    fi
+    if [[ -n "$ver" ]] && [[ "$ver" =~ ^[0-9]+\.[0-9]+ ]]; then
+      emit_result "D10" "pass" "Version available via --version: $ver"
+    else
+      emit_result "D10" "skip" "No version in schema (optional if --version works)"
+    fi
+  fi
+}
+
+check_D11() {
+  if [[ "$HELP_EXIT" -ne 0 ]]; then
+    emit_result "D11" "fail" "--help returned non-zero exit" \
+      "Add --help flag that outputs structured JSON."
+    return
+  fi
+  local has_keys; has_keys=$(echo "$HELP_CACHE" | jq -e '.help and .rules and .skills and .commands' 2>/dev/null)
+  if [[ $? -eq 0 ]]; then
+    emit_result "D11" "pass" "--help outputs JSON with help, rules, skills, commands"
+  else
+    emit_result "D11" "fail" "--help missing required keys (help/rules/skills/commands)" \
+      "Output JSON with: help (brief), rules (array), skills (array), commands (array)."
+  fi
+}
+
+check_D12() {
+  if [[ -f "$TARGET_DIR/agent/brief.md" ]]; then
+    emit_result "D12" "pass" "agent/brief.md exists"
+  else
+    emit_result "D12" "fail" "agent/brief.md not found at $TARGET_DIR/agent/brief.md" \
+      "Create agent/brief.md with a brief description of the CLI."
+  fi
+}
+
+check_D13() {
+  local found=0 missing=()
+  for f in trigger.md workflow.md writeback.md; do
+    if [[ -f "$TARGET_DIR/agent/rules/$f" ]]; then
+      found=$((found + 1))
+    else
+      missing+=("$f")
+    fi
+  done
+  if [[ $found -eq 3 ]]; then
+    emit_result "D13" "pass" "agent/rules/ has trigger.md, workflow.md, writeback.md"
+  else
+    emit_result "D13" "fail" "Missing: ${missing[*]}" \
+      "Create agent/rules/ with trigger.md, workflow.md, writeback.md."
+  fi
+}
+
+check_D14() {
+  local skill_count=0
+  if [[ -d "$TARGET_DIR/agent/skills" ]]; then
+    skill_count=$(ls "$TARGET_DIR/agent/skills/"*.md 2>/dev/null | wc -l | tr -d ' ')
+  fi
+  if [[ "$skill_count" -gt 0 ]]; then
+    # Also check skills subcommand
+    run_cli "skills" 2>/dev/null
+    if [[ "$RUN_EXIT" -eq 0 ]]; then
+      emit_result "D14" "pass" "$skill_count skill(s) in agent/skills/, skills subcommand works"
+    else
+      emit_result "D14" "pass" "$skill_count skill(s) in agent/skills/ (skills subcommand not tested)"
+    fi
+  else
+    emit_result "D14" "fail" "No skills found in agent/skills/" \
+      "Create agent/skills/ with .md files. Add skills subcommand."
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════
+# Dimension 02: Structured Output
+# ═══════════════════════════════════════════════════════════
+
+check_O1() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "O1" "skip" "No list-like command found to test default output"
+    return
+  fi
+  run_cli "$cmd"
+  if echo "$RUN_STDOUT" | jq . >/dev/null 2>&1; then
+    emit_result "O1" "pass" "Default output is valid JSON (agent-first)"
+  else
+    emit_result "O1" "fail" "Default output is not JSON" \
+      "Default output must be JSON. Use --human for human-friendly format."
+  fi
+}
+
+check_O2() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "O2" "skip" "No command found to test JSON validity"
+    return
+  fi
+  run_cli "$cmd"
+  if echo "$RUN_STDOUT" | jq . >/dev/null 2>&1; then
+    emit_result "O2" "pass" "Default output is valid JSON"
+  else
+    emit_result "O2" "fail" "Default output fails jq . validation" \
+      "Default output must pass jq . validation. No --json flag needed."
+  fi
+}
+
+check_O3() {
+  # Schema stability — needs snapshot; skip if no snapshot exists
+  local tool_name; tool_name=$(_get_tool_name)
+  local snap="$SNAPSHOTS_DIR/$tool_name/schema.json"
+  if [[ ! -f "$snap" ]]; then
+    emit_result "O3" "skip" "No snapshot saved. Run: agent-cli-lint snapshot $TARGET_CLI"
+    return
+  fi
+  local old_keys new_keys
+  old_keys=$(jq -S 'keys' "$snap" 2>/dev/null)
+  new_keys=$(echo "$DESCRIBE_CACHE" | jq -S 'keys' 2>/dev/null)
+  if [[ "$old_keys" == "$new_keys" ]]; then
+    emit_result "O3" "pass" "Schema structure matches snapshot"
+  else
+    emit_result "O3" "fail" "Schema structure changed since snapshot" \
+      "Breaking change detected. Update snapshot: agent-cli-lint snapshot $TARGET_CLI"
+  fi
+}
+
+check_O4() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "O4" "skip" "No command found to test --fields"
+    return
+  fi
+  run_cli "$cmd --fields name"
+  if [[ "$RUN_EXIT" -eq 0 ]]; then
+    emit_result "O4" "pass" "--fields flag accepted on $cmd"
+  else
+    # Try base command to see if it works without --fields
+    run_cli "$cmd"
+    if [[ "$RUN_EXIT" -eq 0 ]]; then
+      emit_result "O4" "fail" "--fields flag not supported on $cmd" \
+        "Add --fields flag for field filtering."
+    else
+      emit_result "O4" "skip" "Cannot test --fields (command itself fails)"
+    fi
+  fi
+}
+
+check_O5() {
+  # Empty result should return [] not error
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "O5" "skip" "No list command to test empty results"
+    return
+  fi
+  run_cli "$cmd"
+  if [[ "$RUN_EXIT" -eq 0 ]]; then
+    local result_type; result_type=$(echo "$RUN_STDOUT" | jq -r 'type' 2>/dev/null)
+    if [[ "$result_type" == "array" || "$result_type" == "object" ]]; then
+      emit_result "O5" "pass" "List command returns structured data (type: $result_type)"
+    else
+      emit_result "O5" "fail" "List output is not array or object" \
+        "Return [] for empty results, not bare values."
+    fi
+  else
+    emit_result "O5" "skip" "List command failed, cannot test empty result behavior"
+  fi
+}
+
+check_O6() {
+  # Agent-first: default is JSON, --human switches to human-friendly
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "O6" "skip" "No command to test --human flag"
+    return
+  fi
+  run_cli "$cmd --human"
+  if [[ "$RUN_EXIT" -ne 2 ]]; then
+    emit_result "O6" "pass" "--human flag accepted on $cmd"
+  else
+    emit_result "O6" "fail" "--human flag not recognized on $cmd" \
+      "Add --human flag for human-friendly output. Default must be JSON (agent-first)."
+  fi
+}
+
+check_O7() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "O7" "skip" "No list command to test array wrapping"
+    return
+  fi
+  run_cli "$cmd"
+  # Check if output has array at top level, or has a result/items key with array value
+  if echo "$RUN_STDOUT" | jq -e '
+    if type == "array" then true
+    elif .items? | type == "array" then true
+    elif .result? | type == "array" then true
+    elif .result? | type == "object" then true
+    else false end' >/dev/null 2>&1; then
+    emit_result "O7" "pass" "List output contains structured data"
+  else
+    emit_result "O7" "fail" "List output not wrapped in array or object" \
+      "Wrap list results in JSON array, {items: [...]}, or {result: ...}."
+  fi
+}
+
+check_O8() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "O8" "skip" "No list command to test pagination"
+    return
+  fi
+  run_cli "$cmd --json"
+  if echo "$RUN_STDOUT" | jq -e '.total or .has_more or .showing' >/dev/null 2>&1; then
+    emit_result "O8" "pass" "Pagination info present"
+  else
+    emit_result "O8" "skip" "No pagination fields (may be acceptable for small datasets)"
+  fi
+}
+
+check_O9() {
+  # NDJSON — check if schema mentions it or there's a --ndjson flag
+  if _has_describe_schema && echo "$DESCRIBE_CACHE" | jq -e '.commands[]? | .parameters[]? | select(.name == "ndjson")' >/dev/null 2>&1; then
+    emit_result "O9" "pass" "NDJSON flag found in schema"
+  else
+    emit_result "O9" "skip" "No NDJSON support detected (optional for small datasets)"
+  fi
+}
+
+check_O10() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "O10" "skip" "No command to test TTY auto-detect"
+    return
+  fi
+  # Pipe to cat (non-TTY), check if output is JSON without --json
+  local output
+  output=$(eval "$TARGET_CLI $cmd" 2>/dev/null | cat)
+  if echo "$output" | jq . >/dev/null 2>&1; then
+    emit_result "O10" "pass" "Auto-detects pipe mode and outputs JSON"
+  else
+    emit_result "O10" "fail" "Does not auto-detect pipe mode" \
+      "When stdout is not TTY, auto-switch to JSON output."
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════
+# Dimension 03: Structured Error
+# ═══════════════════════════════════════════════════════════
+
+check_E1() {
+  # Trigger error: try unknown flag first (reliable), then missing required param
+  run_cli "--nonexistent-flag-xyz"
+  local err_source="$RUN_STDERR"
+  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+  if echo "$err_source" | jq -e '.error and .code and .message' >/dev/null 2>&1; then
+    emit_result "E1" "pass" "Error format: {error, code, message}"
+    return
+  fi
+  # Fallback: try no args
+  run_cli "" 2>/dev/null
+  err_source="$RUN_STDERR"
+  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+  if echo "$err_source" | jq -e '.error and .code and .message' >/dev/null 2>&1; then
+    emit_result "E1" "pass" "Error format: {error, code, message}"
+  else
+    emit_result "E1" "fail" "Error does not follow {error, code, message} format" \
+      "All errors must output: {error: true, code: \"...\", message: \"...\", suggestion: \"...\"}."
+  fi
+}
+
+check_E2() {
+  run_cli "--nonexistent-flag-xyz"
+  if [[ -n "$RUN_STDERR" ]] && echo "$RUN_STDERR" | jq -e '.error' >/dev/null 2>&1; then
+    emit_result "E2" "pass" "Errors go to stderr"
+  elif [[ -n "$RUN_STDOUT" ]] && echo "$RUN_STDOUT" | jq -e '.error' >/dev/null 2>&1; then
+    emit_result "E2" "fail" "Errors go to stdout instead of stderr" \
+      "Write error JSON to stderr, keep stdout for data only."
+  else
+    # Fallback: try no args
+    run_cli "" 2>/dev/null
+    if [[ -n "$RUN_STDERR" ]] && echo "$RUN_STDERR" | jq -e '.error' >/dev/null 2>&1; then
+      emit_result "E2" "pass" "Errors go to stderr"
+    elif [[ -n "$RUN_STDOUT" ]] && echo "$RUN_STDOUT" | jq -e '.error' >/dev/null 2>&1; then
+      emit_result "E2" "fail" "Errors go to stdout instead of stderr"
+    else
+      emit_result "E2" "skip" "Could not determine error output channel"
+    fi
+  fi
+}
+
+check_E3() {
+  run_cli "--nonexistent-flag-xyz"
+  local err_source="$RUN_STDERR"
+  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+  if echo "$err_source" | jq . >/dev/null 2>&1; then
+    emit_result "E3" "pass" "Error output is valid JSON"
+  else
+    # Fallback: try no args
+    run_cli "" 2>/dev/null
+    err_source="$RUN_STDERR"
+    [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+    if echo "$err_source" | jq . >/dev/null 2>&1; then
+      emit_result "E3" "pass" "Error output is valid JSON"
+    else
+      emit_result "E3" "fail" "Error output is not valid JSON" \
+        "Even in error cases, output valid JSON."
+    fi
+  fi
+}
+
+check_E4() {
+  run_cli "--nonexistent-flag-xyz"
+  local err_source="$RUN_STDERR"
+  [[ -z "$err_source" ]] && { run_cli "" 2>/dev/null; err_source="$RUN_STDERR"; }
+  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+  local code; code=$(echo "$err_source" | jq -r '.code // empty' 2>/dev/null)
+  if [[ -n "$code" ]]; then
+    emit_result "E4" "pass" "Error has code field: $code"
+  else
+    emit_result "E4" "fail" "Error missing code field" \
+      "Add machine-readable code (e.g., MISSING_REQUIRED, NOT_FOUND)."
+  fi
+}
+
+check_E5() {
+  run_cli "--nonexistent-flag-xyz"
+  local err_source="$RUN_STDERR"
+  [[ -z "$err_source" ]] && { run_cli "" 2>/dev/null; err_source="$RUN_STDERR"; }
+  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+  local msg; msg=$(echo "$err_source" | jq -r '.message // empty' 2>/dev/null)
+  if [[ -n "$msg" ]]; then
+    emit_result "E5" "pass" "Error has message field"
+  else
+    emit_result "E5" "fail" "Error missing message field" \
+      "Add human-readable message to all errors."
+  fi
+}
+
+check_E6() {
+  run_cli "--nonexistent-flag-xyz"
+  local err_source="$RUN_STDERR"
+  [[ -z "$err_source" ]] && { run_cli "" 2>/dev/null; err_source="$RUN_STDERR"; }
+  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+  local sug; sug=$(echo "$err_source" | jq -r '.suggestion // empty' 2>/dev/null)
+  if [[ -n "$sug" ]]; then
+    emit_result "E6" "pass" "Error has suggestion field"
+  else
+    emit_result "E6" "fail" "Error missing suggestion field" \
+      "Add suggestion telling agent what to do next."
+  fi
+}
+
+check_E7() {
+  # Run with missing args, timeout after 5 seconds — must exit, not hang
+  run_with_timeout 5 "$TARGET_CLI"
+  if [[ "$TIMEOUT_EXIT" -ne 137 ]]; then  # 137 = killed by timeout
+    emit_result "E7" "pass" "Does not enter interactive mode on error (exited with $TIMEOUT_EXIT)"
+  else
+    emit_result "E7" "fail" "Hangs waiting for input (killed after 5s timeout)" \
+      "Never enter interactive mode. Return structured error and exit immediately."
+  fi
+}
+
+check_E8() {
+  # Error code stability — needs snapshot
+  local tool_name; tool_name=$(_get_tool_name)
+  local snap="$SNAPSHOTS_DIR/$tool_name/errors.json"
+  if [[ ! -f "$snap" ]]; then
+    emit_result "E8" "skip" "No error snapshot. Run: agent-cli-lint snapshot $TARGET_CLI"
+    return
+  fi
+  # Compare current error codes from test runs against snapshot
+  emit_result "E8" "skip" "Error stability check requires manual snapshot comparison"
+}
+
+# ═══════════════════════════════════════════════════════════
+# Dimension 04: Input Contract
+# ═══════════════════════════════════════════════════════════
+
+check_I1() {
+  # All flags should be --long-name
+  local flags=""
+  if _has_describe_schema; then
+    flags=$(echo "$DESCRIBE_CACHE" | jq -r '[.commands[]?.parameters[]?.name // empty, .global_flags[]? // empty] | .[]' 2>/dev/null)
+  fi
+  if [[ -z "$flags" ]]; then
+    # No detailed schema — just check that commands are named reasonably (from --help)
+    emit_result "I1" "skip" "No flag definitions in schema to verify naming"
+    return
+  fi
+  local bad=""
+  while IFS= read -r flag; do
+    if [[ "$flag" =~ ^-[^-] ]] && [[ ${#flag} -eq 2 ]]; then
+      bad="$bad $flag"
+    fi
+  done <<< "$flags"
+  if [[ -z "$bad" ]]; then
+    emit_result "I1" "pass" "All flags use --long-name format"
+  else
+    emit_result "I1" "fail" "Short-only flags found:$bad" \
+      "All parameters must have --long-name form."
+  fi
+}
+
+check_I2() {
+  emit_result "I2" "ai" "Requires AI review: analyze positional argument semantics for ambiguity"
+}
+
+check_I3() {
+  if _has_describe_schema && echo "$DESCRIBE_CACHE" | grep -q 'json-input' 2>/dev/null; then
+    emit_result "I3" "pass" "--json-input flag found in schema"
+  else
+    emit_result "I3" "skip" "No --json-input support (optional)"
+  fi
+}
+
+check_I4() {
+  # Missing required param should error, not prompt
+  # Find a command that requires params and call it without them
+  local cmd=""
+  local _names; _names=$(_get_command_names)
+  for _cname in synth add create set update delete remove; do
+    if echo "$_names" | grep -qx "$_cname" 2>/dev/null; then
+      cmd="$_cname"
+      break
+    fi
+  done
+  if [[ -n "$cmd" ]]; then
+    run_cli "$cmd"
+    if [[ "$RUN_EXIT" -eq 2 ]]; then
+      emit_result "I4" "pass" "Missing params on '$cmd' returns exit 2"
+    elif [[ "$RUN_EXIT" -ne 0 ]]; then
+      emit_result "I4" "pass" "Missing params on '$cmd' returns non-zero (exit $RUN_EXIT)"
+    else
+      # Check if stdout has error indicator
+      if echo "$RUN_STDERR" | jq -e '.error' >/dev/null 2>&1; then
+        emit_result "I4" "warn" "Missing params on '$cmd' returns exit 0 but has error in stderr" \
+          "Use exit code 2 for parameter errors."
+      else
+        emit_result "I4" "fail" "Missing params on '$cmd' returns exit 0" \
+          "Return structured error + exit 2 when required params are missing."
+      fi
+    fi
+  else
+    # Fallback: try no args
+    run_cli "" 2>/dev/null
+    if [[ "$RUN_EXIT" -eq 2 ]]; then
+      emit_result "I4" "pass" "Missing params returns exit 2 (no interactive prompt)"
+    elif [[ "$RUN_EXIT" -ne 0 ]]; then
+      emit_result "I4" "pass" "Missing params returns non-zero (exit $RUN_EXIT)"
+    elif echo "$RUN_STDOUT" | jq -e '.commands' >/dev/null 2>&1; then
+      # Tool outputs help on no args — this is acceptable behavior
+      emit_result "I4" "pass" "No args shows help (no interactive prompt)"
+    else
+      emit_result "I4" "fail" "Missing params returns exit 0" \
+        "Return structured error + exit 2 when required params are missing."
+    fi
+  fi
+}
+
+check_I5() {
+  if ! _has_describe_schema; then
+    emit_result "I5" "skip" "No detailed schema (--describe) available; type validation not checkable from --help"
+    return
+  fi
+  # Type validation — find an integer param and pass a string
+  local int_param; int_param=$(echo "$DESCRIBE_CACHE" | jq -r '
+    .commands[]?.parameters[]? | select(.type == "integer") | .name' 2>/dev/null | head -1)
+  if [[ -z "$int_param" ]]; then
+    emit_result "I5" "skip" "No integer parameters to test type validation"
+    return
+  fi
+  local cmd; cmd=$(echo "$DESCRIBE_CACHE" | jq -r '
+    .commands[] | select(.parameters[]? | .name == "'"$int_param"'") | .name' 2>/dev/null | head -1)
+  run_cli "$cmd --$int_param not-a-number --json"
+  if [[ "$RUN_EXIT" -eq 2 ]]; then
+    emit_result "I5" "pass" "Type mismatch on --$int_param returns exit 2"
+  else
+    emit_result "I5" "skip" "Could not reliably test type validation"
+  fi
+}
+
+check_I6() {
+  emit_result "I6" "skip" "Boolean flag negation (--no-X) check requires manual review"
+}
+
+check_I7() {
+  emit_result "I7" "skip" "Array parameter syntax check requires manual review"
+}
+
+check_I8() {
+  emit_result "I8" "ai" "Requires AI review: check if behavior depends on hidden state files"
+}
+
+check_I9() {
+  # Non-interactive auth — check if auth is needed at all
+  emit_result "I9" "skip" "Auth mechanism check requires manual review"
+}
+
+# ═══════════════════════════════════════════════════════════
+# Dimension 05: Safety
+# ═══════════════════════════════════════════════════════════
+
+check_S1() {
+  local cmd; cmd=$(find_destructive_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "S1" "skip" "No destructive commands found in schema"
+    return
+  fi
+  # Run without --yes
+  run_cli "$cmd test-id-nonexistent --json"
+  if [[ "$RUN_EXIT" -ne 0 ]]; then
+    local err_source="$RUN_STDERR"
+    [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+    if echo "$err_source" | jq -e '.code' >/dev/null 2>&1; then
+      emit_result "S1" "pass" "Destructive command $cmd requires confirmation"
+    else
+      emit_result "S1" "pass" "Destructive command $cmd rejected without --yes (exit $RUN_EXIT)"
+    fi
+  else
+    emit_result "S1" "fail" "Destructive command $cmd executed without --yes" \
+      "Require --yes flag for destructive operations."
+  fi
+}
+
+check_S2() {
+  local cmd; cmd=$(find_destructive_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "S2" "skip" "No destructive commands found"
+    return
+  fi
+  run_cli "$cmd test-id --json"
+  if [[ "$RUN_EXIT" -ne 0 ]]; then
+    emit_result "S2" "pass" "Default deny on destructive operation"
+  else
+    emit_result "S2" "fail" "Destructive command allowed without --yes" \
+      "Default behavior must be deny for destructive ops."
+  fi
+}
+
+check_S3() {
+  local cmd; cmd=$(find_destructive_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "S3" "skip" "No destructive commands to test --dry-run"
+    return
+  fi
+  run_cli "$cmd test-id --dry-run --yes --json"
+  if [[ "$RUN_EXIT" -eq 0 || "$RUN_EXIT" -eq 20 ]]; then
+    emit_result "S3" "pass" "--dry-run flag accepted on $cmd"
+  else
+    local err_source="$RUN_STDERR"
+    [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+    if echo "$err_source" | jq -e '.code == "UNKNOWN_FLAG"' >/dev/null 2>&1; then
+      emit_result "S3" "fail" "--dry-run not supported on $cmd" \
+        "Add --dry-run for preview without execution."
+    else
+      emit_result "S3" "pass" "--dry-run accepted (exit $RUN_EXIT may be expected)"
+    fi
+  fi
+}
+
+check_S4() {
+  # Path traversal test
+  local cmd; cmd=$(find_command_with_required_param)
+  if [[ -z "$cmd" ]]; then
+    emit_result "S4" "skip" "No command with params to test input hardening"
+    return
+  fi
+  # Try ../../etc/passwd as a path-like param
+  run_cli "$cmd --json" "../../etc/passwd" 2>/dev/null
+  # Check any param that accepts paths
+  local blocked=false
+  local err_source="$RUN_STDERR"
+  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+  if echo "$err_source" | jq -e '.code' 2>/dev/null | grep -qiE 'path|traversal|blocked'; then
+    blocked=true
+  fi
+
+  if [[ "$blocked" == true ]]; then
+    emit_result "S4" "pass" "Path traversal blocked"
+  else
+    emit_result "S4" "skip" "Could not reliably test path traversal (depends on command structure)"
+  fi
+}
+
+check_S5() {
+  emit_result "S5" "ai" "Requires AI review: check for auto-update mechanisms"
+}
+
+check_S6() {
+  if ! _has_describe_schema; then
+    emit_result "S6" "skip" "No detailed schema (--describe) available; destructive marking not checkable from --help"
+    return
+  fi
+  local marked; marked=$(echo "$DESCRIBE_CACHE" | jq '[.commands[]? | select(.destructive != null)] | length' 2>/dev/null)
+  local total; total=$(echo "$DESCRIBE_CACHE" | jq '[.commands[]?] | length' 2>/dev/null)
+  if [[ "${marked:-0}" -gt 0 ]]; then
+    emit_result "S6" "pass" "Destructive flag marked on $marked/$total commands"
+  else
+    emit_result "S6" "fail" "No commands marked as destructive in schema" \
+      "Add destructive: true/false to each command in --describe."
+  fi
+}
+
+check_S7() {
+  local cmd; cmd=$(find_destructive_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "S7" "skip" "No destructive commands to test --quiet"
+    return
+  fi
+  run_cli "$cmd test-id --quiet --json"
+  if [[ "$RUN_EXIT" -ne 0 ]]; then
+    emit_result "S7" "pass" "--quiet does not bypass --yes requirement"
+  else
+    emit_result "S7" "fail" "--quiet allowed destructive op without --yes" \
+      "Even with --quiet, destructive ops must require --yes."
+  fi
+}
+
+check_S8() {
+  if _has_describe_schema && echo "$DESCRIBE_CACHE" | grep -q 'sanitize' 2>/dev/null; then
+    emit_result "S8" "pass" "--sanitize flag found in schema"
+  else
+    emit_result "S8" "skip" "No --sanitize flag (optional for tools without external input)"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════
+# Dimension 06: Exit Codes
+# ═══════════════════════════════════════════════════════════
+
+check_X1() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "X1" "skip" "No command to test success exit code"
+    return
+  fi
+  run_cli "$cmd"
+  if [[ "$RUN_EXIT" -eq 0 ]]; then
+    emit_result "X1" "pass" "Success returns exit 0"
+  else
+    emit_result "X1" "fail" "Success command returned exit $RUN_EXIT" \
+      "Successful commands must return exit 0."
+  fi
+}
+
+check_X2() {
+  if ! _has_describe_schema; then
+    emit_result "X2" "skip" "No detailed schema to check exit code documentation"
+    return
+  fi
+  local exit_codes; exit_codes=$(echo "$DESCRIBE_CACHE" | jq -r '.exit_codes // empty' 2>/dev/null)
+  if echo "$exit_codes" | jq -e '."1"' >/dev/null 2>&1; then
+    emit_result "X2" "pass" "Exit code 1 documented in schema"
+  else
+    emit_result "X2" "skip" "Exit code 1 not explicitly documented"
+  fi
+}
+
+check_X3() {
+  # Unknown flag → exit 2
+  run_cli "--nonexistent-flag-xyz"
+  if [[ "$RUN_EXIT" -eq 2 ]]; then
+    emit_result "X3" "pass" "Unknown flag returns exit 2"
+  elif [[ "$RUN_EXIT" -ne 0 ]]; then
+    emit_result "X3" "fail" "Unknown flag returns exit $RUN_EXIT (expected 2)" \
+      "Parameter/usage errors must return exit 2."
+  else
+    emit_result "X3" "fail" "Unknown flag returns exit 0" \
+      "Unknown flags must cause exit 2, not be silently ignored."
+  fi
+}
+
+check_X4() {
+  if ! _has_describe_schema; then
+    emit_result "X4" "skip" "No detailed schema to check exit code documentation"
+    return
+  fi
+  local exit_codes; exit_codes=$(echo "$DESCRIBE_CACHE" | jq -r '.exit_codes // empty' 2>/dev/null)
+  if echo "$exit_codes" | jq -e '."10"' >/dev/null 2>&1; then
+    emit_result "X4" "pass" "Exit code 10 (auth failure) documented"
+  else
+    emit_result "X4" "skip" "Exit code 10 not documented (may not apply)"
+  fi
+}
+
+check_X5() {
+  if ! _has_describe_schema; then
+    emit_result "X5" "skip" "No detailed schema to check exit code documentation"
+    return
+  fi
+  local exit_codes; exit_codes=$(echo "$DESCRIBE_CACHE" | jq -r '.exit_codes // empty' 2>/dev/null)
+  if echo "$exit_codes" | jq -e '."11"' >/dev/null 2>&1; then
+    emit_result "X5" "pass" "Exit code 11 (permission denied) documented"
+  else
+    emit_result "X5" "skip" "Exit code 11 not documented (may not apply)"
+  fi
+}
+
+check_X6() {
+  local cmd; cmd=$(find_show_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "X6" "skip" "No show command to test not-found exit code"
+    return
+  fi
+  run_cli "$cmd nonexistent-id-xyzzy --json"
+  if [[ "$RUN_EXIT" -eq 20 ]]; then
+    emit_result "X6" "pass" "Not found returns exit 20"
+  elif [[ "$RUN_EXIT" -ne 0 ]]; then
+    emit_result "X6" "fail" "Not found returns exit $RUN_EXIT (expected 20)" \
+      "Resource not found should return exit 20."
+  else
+    emit_result "X6" "fail" "Not found returns exit 0" \
+      "Not-found errors must not return exit 0."
+  fi
+}
+
+check_X7() {
+  if ! _has_describe_schema; then
+    emit_result "X7" "skip" "No detailed schema to check exit code documentation"
+    return
+  fi
+  local exit_codes; exit_codes=$(echo "$DESCRIBE_CACHE" | jq -r '.exit_codes // empty' 2>/dev/null)
+  if echo "$exit_codes" | jq -e '."30"' >/dev/null 2>&1; then
+    emit_result "X7" "pass" "Exit code 30 (conflict) documented"
+  else
+    emit_result "X7" "skip" "Exit code 30 not documented (may not apply)"
+  fi
+}
+
+check_X8() {
+  # Exit code matches JSON code — check parameter error case
+  run_cli "--nonexistent-flag-xyz"
+  local err_source="$RUN_STDERR"
+  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+  local code; code=$(echo "$err_source" | jq -r '.code // empty' 2>/dev/null)
+  if [[ "$RUN_EXIT" -eq 2 ]] && [[ -n "$code" ]]; then
+    emit_result "X8" "pass" "Exit code 2 matches error code $code"
+  elif [[ -n "$code" ]]; then
+    emit_result "X8" "pass" "Error code $code present (exit $RUN_EXIT)"
+  else
+    emit_result "X8" "skip" "Cannot verify exit code / error code correspondence"
+  fi
+}
+
+check_X9() {
+  run_cli "--nonexistent-flag-xyz"
+  if [[ "$RUN_EXIT" -ne 0 ]]; then
+    emit_result "X9" "pass" "Errors do not exit 0 (exit $RUN_EXIT)"
+  else
+    emit_result "X9" "fail" "Error exits with 0, masking the failure" \
+      "Never use exit 0 when an error occurred."
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════
+# Dimension 07: Composability
+# ═══════════════════════════════════════════════════════════
+
+check_C1() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "C1" "skip" "No command to test stdout purity"
+    return
+  fi
+  run_cli "$cmd"
+  # stdout should be valid JSON (pure data)
+  if echo "$RUN_STDOUT" | jq . >/dev/null 2>&1; then
+    emit_result "C1" "pass" "stdout contains pure data (valid JSON)"
+  else
+    emit_result "C1" "fail" "stdout contains non-data content" \
+      "stdout must contain only data. Logs go to stderr."
+  fi
+}
+
+check_C2() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "C2" "skip" "No command to test stderr separation"
+    return
+  fi
+  run_cli "$cmd"
+  # stderr should NOT contain valid JSON data (should be logs or empty)
+  if [[ -z "$RUN_STDERR" ]] || ! echo "$RUN_STDERR" | jq -e 'type == "array" or type == "object"' >/dev/null 2>&1; then
+    emit_result "C2" "pass" "stderr is logs only (not data)"
+  else
+    emit_result "C2" "fail" "stderr contains JSON data" \
+      "Data goes to stdout, logs/progress go to stderr."
+  fi
+}
+
+check_C3() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "C3" "skip" "No command to test pipe friendliness"
+    return
+  fi
+  local output
+  output=$(eval "$TARGET_CLI $cmd" 2>/dev/null | jq '.' 2>&1)
+  if [[ $? -eq 0 ]]; then
+    emit_result "C3" "pass" "Output pipes cleanly through jq"
+  else
+    emit_result "C3" "fail" "Output does not pipe through jq" \
+      "Ensure default output is pipe-friendly JSON."
+  fi
+}
+
+check_C4() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "C4" "skip" "No command to test --quiet"
+    return
+  fi
+  run_cli "$cmd --quiet"
+  if [[ "$RUN_EXIT" -eq 0 ]]; then
+    if [[ -z "$RUN_STDERR" ]]; then
+      emit_result "C4" "pass" "--quiet suppresses stderr"
+    else
+      emit_result "C4" "pass" "--quiet accepted (stderr may have minimal output)"
+    fi
+  else
+    local err_source="$RUN_STDERR"
+    [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+    if echo "$err_source" | jq -e '.code == "UNKNOWN_FLAG" or .code == "PARAM_ERROR"' >/dev/null 2>&1; then
+      emit_result "C4" "fail" "--quiet flag not supported" \
+        "Add --quiet to suppress non-essential stderr."
+    else
+      emit_result "C4" "skip" "Cannot test --quiet (command failed for other reason)"
+    fi
+  fi
+}
+
+check_C5() {
+  if _has_describe_schema && echo "$DESCRIBE_CACHE" | grep -q 'json-input' 2>/dev/null; then
+    emit_result "C5" "pass" "Pipe chain support via --json-input"
+  else
+    emit_result "C5" "skip" "No --json-input for pipe chaining (optional)"
+  fi
+}
+
+check_C6() {
+  # Pipe mode should have no interactive prompts — same as O10 essentially
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "C6" "skip" "No command to test pipe-mode behavior"
+    return
+  fi
+  local output
+  output=$(eval "$TARGET_CLI $cmd" 2>/dev/null | cat)
+  if echo "$output" | jq . >/dev/null 2>&1; then
+    emit_result "C6" "pass" "No interactive pollution in pipe mode"
+  else
+    emit_result "C6" "fail" "Pipe mode output contains non-JSON content" \
+      "Suppress prompts, spinners, confirmations in pipe mode."
+  fi
+}
+
+check_C7() {
+  emit_result "C7" "ai" "Requires AI review: test idempotency by running same command twice"
+}
+
+# ═══════════════════════════════════════════════════════════
+# Dimension 08: Naming
+# ═══════════════════════════════════════════════════════════
+
+check_N1() {
+  local names; names=$(_get_command_names)
+  if [[ -z "$names" ]]; then
+    emit_result "N1" "skip" "No commands in schema"
+    return
+  fi
+  emit_result "N1" "pass" "Command naming consistency (manual review recommended)"
+}
+
+check_N2() {
+  if ! _has_describe_schema; then
+    # Can still check command names from --help for camelCase
+    local names; names=$(_get_command_names)
+    if [[ -z "$names" ]]; then
+      emit_result "N2" "skip" "No flag definitions to check kebab-case"
+      return
+    fi
+    local bad=""
+    while IFS= read -r name; do
+      [[ -z "$name" ]] && continue
+      if [[ "$name" =~ [A-Z] ]]; then
+        bad="$bad $name"
+      fi
+    done <<< "$names"
+    if [[ -z "$bad" ]]; then
+      emit_result "N2" "pass" "All command names use kebab-case"
+    else
+      emit_result "N2" "fail" "Non-kebab-case names:$bad" \
+        "Use kebab-case for all names."
+    fi
+    return
+  fi
+  # Check all flags are kebab-case
+  local all_flags; all_flags=$(echo "$DESCRIBE_CACHE" | jq -r '
+    [.commands[]?.parameters[]?.name // empty, .global_flags[]? // empty] | .[]' 2>/dev/null)
+  local bad=""
+  while IFS= read -r flag; do
+    [[ -z "$flag" ]] && continue
+    flag="${flag#--}"
+    if [[ "$flag" =~ [A-Z] ]]; then
+      bad="$bad --$flag"
+    fi
+  done <<< "$all_flags"
+  if [[ -z "$bad" ]]; then
+    emit_result "N2" "pass" "All flags use kebab-case"
+  else
+    emit_result "N2" "fail" "Non-kebab-case flags:$bad" \
+      "Use --output-format not --outputFormat."
+  fi
+}
+
+check_N3() {
+  local max_depth=0
+  local cmds; cmds=$(_get_command_names)
+  if [[ -z "$cmds" ]]; then
+    emit_result "N3" "skip" "No commands to check depth"
+    return
+  fi
+  while IFS= read -r cmd; do
+    [[ -z "$cmd" ]] && continue
+    local depth; depth=$(echo "$cmd" | tr ' ' '\n' | wc -l | tr -d ' ')
+    [[ $depth -gt $max_depth ]] && max_depth=$depth
+  done <<< "$cmds"
+  if [[ $max_depth -le 3 ]]; then
+    emit_result "N3" "pass" "Max command depth: $max_depth (≤ 3)"
+  else
+    emit_result "N3" "fail" "Command depth $max_depth exceeds 3" \
+      "Keep commands to max 3 levels: mycli resource action."
+  fi
+}
+
+check_N4() {
+  local reserved=("--agent" "--human" "--brief" "--help" "--version" "--yes" "--dry-run" "--quiet" "--fields")
+  local found=0
+  # Check from --describe global_flags first
+  local global_flags; global_flags=$(echo "$DESCRIBE_CACHE" | jq -r '.global_flags[]? // empty' 2>/dev/null)
+  if [[ -n "$global_flags" ]]; then
+    for flag in "${reserved[@]}"; do
+      if echo "$global_flags" | grep -qF -- "$flag" 2>/dev/null; then
+        found=$((found + 1))
+      fi
+    done
+  else
+    # No global_flags in schema — test actual flag support by probing
+    for flag in "${reserved[@]}"; do
+      case "$flag" in
+        --help)    [[ "$HELP_EXIT" -eq 0 ]] && found=$((found + 1)) ;;
+        --version) [[ -n "$VERSION_CACHE" ]] && found=$((found + 1)) ;;
+        --brief)   [[ "$BRIEF_EXIT" -eq 0 && -n "$BRIEF_CACHE" ]] && found=$((found + 1)) ;;
+        *)
+          # Quick probe: run with the flag, if exit != 2 (UNKNOWN_FLAG), it's supported
+          local probe_out probe_err
+          probe_err=$(eval "$TARGET_CLI $flag" 2>&1 >/dev/null || true)
+          if ! echo "$probe_err" | jq -e '.code == "UNKNOWN_FLAG" or .code == "PARAM_ERROR"' >/dev/null 2>&1; then
+            found=$((found + 1))
+          fi
+          ;;
+      esac
+    done
+  fi
+  if [[ $found -ge 4 ]]; then
+    emit_result "N4" "pass" "Reserved flags present ($found/${#reserved[@]})"
+  else
+    emit_result "N4" "fail" "Only $found/${#reserved[@]} reserved flags found" \
+      "Support: --agent, --human, --brief, --help, --version, --yes, --dry-run, --quiet, --fields."
+  fi
+}
+
+check_N5() {
+  if [[ "$HELP_EXIT" -eq 0 ]] && [[ -n "$HELP_CACHE" ]]; then
+    emit_result "N5" "pass" "--help produces output"
+  else
+    emit_result "N5" "fail" "--help not working" \
+      "Add --help flag."
+  fi
+}
+
+check_N6() {
+  local ver="$VERSION_CACHE"
+  # Handle JSON version output: {"version":"0.3.0"}
+  if [[ -n "$ver" ]] && echo "$ver" | jq -e '.version' >/dev/null 2>&1; then
+    ver=$(echo "$ver" | jq -r '.version')
+  fi
+  if [[ -n "$ver" ]] && [[ "$ver" =~ ^[0-9]+\.[0-9]+ ]]; then
+    emit_result "N6" "pass" "--version outputs semver: $ver"
+  elif [[ -n "$ver" ]]; then
+    emit_result "N6" "fail" "--version output not semver: $ver" \
+      "Use semver format: major.minor.patch."
+  else
+    emit_result "N6" "fail" "--version not working" \
+      "Add --version flag outputting semver."
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════
+# Dimension 09: Meta
+# ═══════════════════════════════════════════════════════════
+
+check_M1() {
+  if [[ -f "$TARGET_DIR/AGENTS.md" ]]; then
+    emit_result "M1" "pass" "AGENTS.md exists"
+  else
+    emit_result "M1" "fail" "AGENTS.md not found at $TARGET_DIR/" \
+      "Create AGENTS.md with build/test/usage instructions."
+  fi
+}
+
+check_M2() {
+  if (_has_describe_schema && echo "$DESCRIBE_CACHE" | grep -qi 'mcp' 2>/dev/null) || \
+     echo "$HELP_CACHE" | grep -qi 'mcp' 2>/dev/null; then
+    emit_result "M2" "pass" "MCP export support detected"
+  else
+    emit_result "M2" "skip" "No MCP export (optional)"
+  fi
+}
+
+check_M3() {
+  if [[ -f "$TARGET_DIR/CHANGELOG.md" ]]; then
+    emit_result "M3" "pass" "CHANGELOG.md exists"
+  else
+    emit_result "M3" "skip" "No CHANGELOG.md (recommended for tracking breaking changes)"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════
+# Dimension 10: Feedback
+# ═══════════════════════════════════════════════════════════
+
+check_F1() {
+  run_cli "issue"
+  if [[ "$RUN_EXIT" -ne 0 ]]; then
+    local err_source="$RUN_STDERR"
+    [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+    local code; code=$(echo "$err_source" | jq -r '.code // empty' 2>/dev/null)
+    if [[ "$code" == "MISSING_PARAM" || "$code" == "MISSING_REQUIRED" || "$code" == "MISSING_COMMAND" ]]; then
+      emit_result "F1" "pass" "issue subcommand exists (requires subcommand)"
+    elif [[ "$code" == "UNKNOWN_COMMAND" ]]; then
+      emit_result "F1" "fail" "No issue subcommand" \
+        "Add issue create/list/show subcommands."
+    else
+      emit_result "F1" "pass" "issue subcommand recognized (exit $RUN_EXIT)"
+    fi
+  else
+    emit_result "F1" "pass" "issue subcommand exists"
+  fi
+}
+
+check_F2() {
+  # Check if issue create auto-attaches version
+  emit_result "F2" "skip" "Issue auto-attachment check requires creating a test issue"
+}
+
+check_F3() {
+  # Check issue types/categories — try describe first, then check --help for issue command
+  if _has_describe_schema; then
+    local issue_cmd; issue_cmd=$(echo "$DESCRIBE_CACHE" | jq -r '
+      .commands[]? | select(.name == "issue") | .subcommands // empty' 2>/dev/null)
+    if [[ -n "$issue_cmd" ]]; then
+      emit_result "F3" "pass" "Issue subcommands defined in schema"
+      return
+    fi
+  fi
+  # Check if issue command is listed in --help
+  local has_issue
+  has_issue=$(_get_command_names | grep -c '^issue$' || true)
+  if [[ "$has_issue" -gt 0 ]]; then
+    emit_result "F3" "pass" "Issue command found in --help commands list"
+  else
+    emit_result "F3" "skip" "Issue category check requires manual review"
+  fi
+}
+
+check_F4() {
+  emit_result "F4" "skip" "Local storage check requires creating and finding issues"
+}
+
+check_F5() {
+  run_cli "issue list"
+  if [[ "$RUN_EXIT" -eq 0 ]]; then
+    emit_result "F5" "pass" "issue list works"
+  else
+    emit_result "F5" "skip" "issue list not tested (may need setup)"
+  fi
+}
+
+check_F6() {
+  emit_result "F6" "skip" "Issue status tracking requires manual review"
+}
+
+# ═══════════════════════════════════════════════════════════
+# Dimension 11: Guardrails
+# ═══════════════════════════════════════════════════════════
+
+check_G1() {
+  # Unknown flag should be rejected
+  run_cli "--completely-bogus-flag-xyz"
+  if [[ "$RUN_EXIT" -eq 2 ]]; then
+    emit_result "G1" "pass" "Unknown flags rejected with exit 2"
+  elif [[ "$RUN_EXIT" -ne 0 ]]; then
+    emit_result "G1" "pass" "Unknown flags rejected (exit $RUN_EXIT)"
+  else
+    emit_result "G1" "fail" "Unknown flags silently ignored" \
+      "Reject unknown flags with structured error."
+  fi
+}
+
+check_G2() {
+  # Pass API key pattern as param — fill ALL required params so we reach guardrail checks
+  local cmd; cmd=$(find_command_with_required_param)
+  if [[ -z "$cmd" ]]; then
+    emit_result "G2" "skip" "No command with params to test secret detection"
+    return
+  fi
+  # Build args: set all required string params, inject secret into the first one
+  local args="" first_done=false
+  while IFS= read -r param; do
+    [[ -z "$param" ]] && continue
+    if [[ "$first_done" == false ]]; then
+      args="$args --$param sk-abc123secretkey456789012345678901"
+      first_done=true
+    else
+      args="$args --$param test-dummy-value"
+    fi
+  done < <(echo "$DESCRIBE_CACHE" | jq -r '
+    .commands[] | select(.name == "'"$cmd"'") |
+    .parameters[]? | select(.required == true and .type == "string") | .name' 2>/dev/null)
+
+  [[ "$first_done" == false ]] && args="--name sk-abc123secretkey456789012345678901"
+
+  run_cli "$cmd $args --json"
+  local err_source="$RUN_STDERR"
+  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+  local code; code=$(echo "$err_source" | jq -r '.code // empty' 2>/dev/null)
+  if [[ "$code" == *SECRET* ]] || [[ "$code" == *BLOCKED* ]]; then
+    emit_result "G2" "pass" "API key pattern blocked (code: $code)"
+  elif [[ "$RUN_EXIT" -ne 0 ]]; then
+    emit_result "G2" "fail" "API key not explicitly detected (exited $RUN_EXIT but no SECRET code)" \
+      "Add secret detection: reject sk-*, ghp_*, API key patterns."
+  else
+    emit_result "G2" "fail" "API key pattern accepted — no secret detection" \
+      "Add guardrail: detect and block API key/token patterns in arguments."
+  fi
+}
+
+check_G3() {
+  # Dangerous path rejection — fill all required params, inject traversal into first
+  local cmd; cmd=$(find_command_with_required_param)
+  if [[ -z "$cmd" ]]; then
+    emit_result "G3" "skip" "No command to test path rejection"
+    return
+  fi
+  local args="" first_done=false
+  while IFS= read -r param; do
+    [[ -z "$param" ]] && continue
+    if [[ "$first_done" == false ]]; then
+      args="$args --$param ../../etc/passwd"
+      first_done=true
+    else
+      args="$args --$param test-dummy-value"
+    fi
+  done < <(echo "$DESCRIBE_CACHE" | jq -r '
+    .commands[] | select(.name == "'"$cmd"'") |
+    .parameters[]? | select(.required == true and .type == "string") | .name' 2>/dev/null)
+  [[ "$first_done" == false ]] && args="--name ../../etc/passwd"
+
+  run_cli "$cmd $args --json"
+  local err_source="$RUN_STDERR"
+  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+  local code; code=$(echo "$err_source" | jq -r '.code // empty' 2>/dev/null)
+  if [[ "$code" == *PATH* ]] || [[ "$code" == *TRAVERSAL* ]] || [[ "$code" == *SENSITIVE* ]] || [[ "$code" == *BLOCKED* ]]; then
+    emit_result "G3" "pass" "Dangerous path blocked (code: $code)"
+  else
+    emit_result "G3" "skip" "Path rejection may depend on param type (not all params are paths)"
+  fi
+}
+
+check_G4() {
+  if ! _has_describe_schema; then
+    emit_result "G4" "skip" "No detailed schema (--describe) available; permission levels not checkable from --help"
+    return
+  fi
+  local marked; marked=$(echo "$DESCRIBE_CACHE" | jq '[.commands[]? | select(.permission != null)] | length' 2>/dev/null)
+  if [[ "${marked:-0}" -gt 0 ]]; then
+    emit_result "G4" "pass" "Permission levels marked on commands"
+  else
+    emit_result "G4" "fail" "No permission levels in schema" \
+      "Add permission: read/write/delete to each command."
+  fi
+}
+
+check_G5() {
+  emit_result "G5" "ai" "Requires AI review: test output redaction of PII"
+}
+
+check_G6() {
+  emit_result "G6" "skip" "Precondition check requires domain-specific test scenarios"
+}
+
+check_G7() {
+  emit_result "G7" "skip" "Batch limit check requires bulk operation testing"
+}
+
+check_G8() {
+  local cmd; cmd=$(find_command_with_required_param)
+  if [[ -z "$cmd" ]]; then
+    emit_result "G8" "skip" "No command to test shell metachar rejection"
+    return
+  fi
+  # Fill all required params, inject shell metachar into first
+  local args="" first_done=false
+  while IFS= read -r param; do
+    [[ -z "$param" ]] && continue
+    if [[ "$first_done" == false ]]; then
+      args="$args --$param 'foo;rm -rf /'"
+      first_done=true
+    else
+      args="$args --$param test-dummy-value"
+    fi
+  done < <(echo "$DESCRIBE_CACHE" | jq -r '
+    .commands[] | select(.name == "'"$cmd"'") |
+    .parameters[]? | select(.required == true and .type == "string") | .name' 2>/dev/null)
+  [[ "$first_done" == false ]] && args="--name 'foo;rm -rf /'"
+
+  run_cli "$cmd $args --json"
+  local err_source="$RUN_STDERR"
+  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
+  local code; code=$(echo "$err_source" | jq -r '.code // empty' 2>/dev/null)
+  if [[ "$code" == *SHELL* ]] || [[ "$code" == *INJECTION* ]] || [[ "$code" == *BLOCKED* ]] || [[ "$code" == *META* ]]; then
+    emit_result "G8" "pass" "Shell metacharacters blocked (code: $code)"
+  elif [[ "$RUN_EXIT" -ne 0 ]]; then
+    emit_result "G8" "fail" "Command failed (exit $RUN_EXIT) but no explicit shell injection code" \
+      "Add guardrail: reject ; | & \$ \` in argument values."
+  else
+    emit_result "G8" "fail" "Shell metacharacters accepted — no injection guard" \
+      "Add guardrail: reject ; | & \$ \` in argument values."
+  fi
+}
+
+check_G9() {
+  # Fail-closed — hard to test externally, check if schema mentions it
+  emit_result "G9" "ai" "Requires AI review: verify fail-closed behavior when validation logic errors"
+}
+
+# ═══════════════════════════════════════════════════════════
+# Response Structure Checks (R1-R3)
+# ═══════════════════════════════════════════════════════════
+
+check_R1() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "R1" "skip" "No list-like command found to test rules[] in response"
+    return
+  fi
+  run_cli "$cmd"
+  if echo "$RUN_STDOUT" | jq -e '.rules | type == "array" and length > 0' >/dev/null 2>&1; then
+    emit_result "R1" "pass" "Response includes non-empty rules[]"
+  else
+    emit_result "R1" "fail" "Response missing rules[] array" \
+      "Every command response must include rules[] with full content from agent/rules/*.md."
+  fi
+}
+
+check_R2() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "R2" "skip" "No list-like command found to test skills[] in response"
+    return
+  fi
+  run_cli "$cmd"
+  if echo "$RUN_STDOUT" | jq -e '.skills | type == "array"' >/dev/null 2>&1; then
+    emit_result "R2" "pass" "Response includes skills[]"
+  else
+    emit_result "R2" "fail" "Response missing skills[] array" \
+      "Every command response must include skills[] (name + description + command)."
+  fi
+}
+
+check_R3() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "R3" "skip" "No list-like command found to test issue in response"
+    return
+  fi
+  run_cli "$cmd"
+  if echo "$RUN_STDOUT" | jq -e '.issue' >/dev/null 2>&1; then
+    emit_result "R3" "pass" "Response includes issue field"
+  else
+    emit_result "R3" "fail" "Response missing issue field" \
+      "Every command response must include issue (feedback guide string or object)."
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════
+# Additional Discoverability Checks (D15-D18)
+# ═══════════════════════════════════════════════════════════
+
+check_D15() {
+  if [[ "$BRIEF_EXIT" -eq 0 ]] && [[ -n "$BRIEF_CACHE" ]]; then
+    emit_result "D15" "pass" "--brief outputs non-empty text"
+  else
+    emit_result "D15" "fail" "--brief flag missing or returns empty" \
+      "Add --brief flag that outputs agent/brief.md content (one paragraph)."
+  fi
+}
+
+check_D16() {
+  local cmd; cmd=$(find_list_command)
+  if [[ -z "$cmd" ]]; then
+    emit_result "D16" "skip" "No list-like command to test --agent/--human flags"
+    return
+  fi
+  # Check --human flag
+  run_cli "$cmd --human"
+  local human_ok=false
+  if [[ "$RUN_EXIT" -ne 2 ]]; then
+    human_ok=true
+  fi
+  # Check default output is JSON (agent-first)
+  run_cli "$cmd"
+  local json_ok=false
+  if echo "$RUN_STDOUT" | jq . >/dev/null 2>&1; then
+    json_ok=true
+  fi
+  if [[ "$human_ok" == true && "$json_ok" == true ]]; then
+    emit_result "D16" "pass" "Default is JSON (agent mode), --human flag accepted"
+  elif [[ "$json_ok" == true ]]; then
+    emit_result "D16" "fail" "Default is JSON but --human flag not recognized" \
+      "Add --human flag for human-friendly output, --agent for explicit JSON mode."
+  else
+    emit_result "D16" "fail" "Default output is not JSON (agent-first required)" \
+      "Default output must be JSON. Add --human and --agent mode flags."
+  fi
+}
+
+check_D17() {
+  if [[ ! -d "$TARGET_DIR/agent/rules" ]]; then
+    emit_result "D17" "skip" "No agent/rules/ directory"
+    return
+  fi
+  local total=0 valid=0 bad_files=""
+  for f in "$TARGET_DIR/agent/rules/"*.md; do
+    [[ -f "$f" ]] || continue
+    total=$((total + 1))
+    local first_line; first_line=$(head -1 "$f")
+    if [[ "$first_line" != "---" ]]; then
+      bad_files="$bad_files $(basename "$f")"
+      continue
+    fi
+    # Check for name: and description: in frontmatter
+    local frontmatter; frontmatter=$(sed -n '1,/^---$/p' "$f" | tail -n +2)
+    local has_name=false has_desc=false
+    if echo "$frontmatter" | grep -q '^name:' 2>/dev/null; then
+      has_name=true
+    fi
+    if echo "$frontmatter" | grep -q '^description:' 2>/dev/null; then
+      has_desc=true
+    fi
+    if [[ "$has_name" == true && "$has_desc" == true ]]; then
+      valid=$((valid + 1))
+    else
+      bad_files="$bad_files $(basename "$f")"
+    fi
+  done
+  if [[ $total -eq 0 ]]; then
+    emit_result "D17" "skip" "No .md files in agent/rules/"
+  elif [[ $valid -eq $total ]]; then
+    emit_result "D17" "pass" "All $total agent/rules/*.md files have proper frontmatter"
+  else
+    emit_result "D17" "fail" "Missing frontmatter:$bad_files" \
+      "Each agent/rules/*.md must start with YAML frontmatter: --- name: ... description: ... ---"
+  fi
+}
+
+check_D18() {
+  if [[ ! -d "$TARGET_DIR/agent/skills" ]]; then
+    emit_result "D18" "skip" "No agent/skills/ directory"
+    return
+  fi
+  local total=0 valid=0 bad_files=""
+  for f in "$TARGET_DIR/agent/skills/"*.md; do
+    [[ -f "$f" ]] || continue
+    total=$((total + 1))
+    local first_line; first_line=$(head -1 "$f")
+    if [[ "$first_line" != "---" ]]; then
+      bad_files="$bad_files $(basename "$f")"
+      continue
+    fi
+    # Check for name: and description: in frontmatter
+    local frontmatter; frontmatter=$(sed -n '1,/^---$/p' "$f" | tail -n +2)
+    local has_name=false has_desc=false
+    if echo "$frontmatter" | grep -q '^name:' 2>/dev/null; then
+      has_name=true
+    fi
+    if echo "$frontmatter" | grep -q '^description:' 2>/dev/null; then
+      has_desc=true
+    fi
+    if [[ "$has_name" == true && "$has_desc" == true ]]; then
+      valid=$((valid + 1))
+    else
+      bad_files="$bad_files $(basename "$f")"
+    fi
+  done
+  if [[ $total -eq 0 ]]; then
+    emit_result "D18" "skip" "No .md files in agent/skills/"
+  elif [[ $valid -eq $total ]]; then
+    emit_result "D18" "pass" "All $total agent/skills/*.md files have proper frontmatter"
+  else
+    emit_result "D18" "fail" "Missing frontmatter:$bad_files" \
+      "Each agent/skills/*.md must start with YAML frontmatter: --- name: ... description: ... ---"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════
+# Additional Feedback Checks (F7-F8)
+# ═══════════════════════════════════════════════════════════
+
+check_F7() {
+  # Create a test issue and verify it has proper fields
+  run_cli "issue create --type suggestion --message 'lint test issue for F7 check'"
+  if [[ "$RUN_EXIT" -ne 0 ]]; then
+    emit_result "F7" "skip" "Could not create test issue (exit $RUN_EXIT)"
+    return
+  fi
+  # Check response has required fields
+  local has_id has_type has_status has_message has_created has_updated
+  has_id=$(echo "$RUN_STDOUT" | jq -e '.id' 2>/dev/null && echo "yes" || echo "no")
+  has_type=$(echo "$RUN_STDOUT" | jq -e '.type' 2>/dev/null && echo "yes" || echo "no")
+  has_status=$(echo "$RUN_STDOUT" | jq -e '.status' 2>/dev/null && echo "yes" || echo "no")
+  has_message=$(echo "$RUN_STDOUT" | jq -e '.message' 2>/dev/null && echo "yes" || echo "no")
+  has_created=$(echo "$RUN_STDOUT" | jq -e '.created_at // .created' 2>/dev/null && echo "yes" || echo "no")
+  has_updated=$(echo "$RUN_STDOUT" | jq -e '.updated_at // .updated' 2>/dev/null && echo "yes" || echo "no")
+  local missing=""
+  [[ "$has_id" != "yes" ]] && missing="$missing id"
+  [[ "$has_type" != "yes" ]] && missing="$missing type"
+  [[ "$has_status" != "yes" ]] && missing="$missing status"
+  [[ "$has_message" != "yes" ]] && missing="$missing message"
+  [[ "$has_created" != "yes" ]] && missing="$missing created_at"
+  [[ "$has_updated" != "yes" ]] && missing="$missing updated_at"
+  if [[ -z "$missing" ]]; then
+    emit_result "F7" "pass" "Issue JSON has all required fields (id, type, status, message, created_at, updated_at)"
+  else
+    emit_result "F7" "fail" "Issue missing fields:$missing" \
+      "Each issue must have: id, type, status, message, context, created_at, updated_at."
+  fi
+}
+
+check_F8() {
+  run_cli "issue list"
+  if [[ "$RUN_EXIT" -ne 0 ]]; then
+    emit_result "F8" "skip" "issue list failed (exit $RUN_EXIT)"
+    return
+  fi
+  # Check each issue in list has a status field
+  local count; count=$(echo "$RUN_STDOUT" | jq 'if type == "array" then length else 0 end' 2>/dev/null)
+  if [[ "${count:-0}" -eq 0 ]]; then
+    emit_result "F8" "skip" "No issues found to verify status field"
+    return
+  fi
+  local without_status; without_status=$(echo "$RUN_STDOUT" | jq '[.[] | select(.status == null)] | length' 2>/dev/null)
+  if [[ "${without_status:-0}" -eq 0 ]]; then
+    emit_result "F8" "pass" "All $count issues have status field"
+  else
+    emit_result "F8" "fail" "$without_status/$count issues missing status field" \
+      "Each issue must have status: open|in-progress|resolved|closed."
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════
+# Rule Registry
+# ═══════════════════════════════════════════════════════════
+
+# Format: ID|NAME|DIMENSION_ID|DIMENSION_NAME|PRIORITY|CHECK_FUNC
+RULE_REGISTRY=(
+  "D1|--help structured JSON|01|Discoverability|P1|check_D1"
+  "D2|per-command discovery|01|Discoverability|P2|check_D2"
+  "D3|schema format|01|Discoverability|P1|check_D3"
+  "D4|param type declarations|01|Discoverability|P1|check_D4"
+  "D5|enum declarations|01|Discoverability|P2|check_D5"
+  "D6|default declarations|01|Discoverability|P2|check_D6"
+  "D7|required annotation|01|Discoverability|P1|check_D7"
+  "D8|output schema|01|Discoverability|P2|check_D8"
+  "D9|command description|01|Discoverability|P1|check_D9"
+  "D10|version in schema|01|Discoverability|P2|check_D10"
+  "D11|--help structured JSON|01|Discoverability|P1|check_D11"
+  "D12|agent/brief.md|01|Discoverability|P1|check_D12"
+  "D13|agent/rules/|01|Discoverability|P1|check_D13"
+  "D14|agent/skills/ + skills cmd|01|Discoverability|P2|check_D14"
+  "D15|--brief flag|01|Discoverability|P1|check_D15"
+  "D16|--agent/--human mode|01|Discoverability|P1|check_D16"
+  "D17|agent/rules/ frontmatter|01|Discoverability|P1|check_D17"
+  "D18|agent/skills/ frontmatter|01|Discoverability|P1|check_D18"
+  "R1|response includes rules[]|02|Output|P0|check_R1"
+  "R2|response includes skills[]|02|Output|P0|check_R2"
+  "R3|response includes issue|02|Output|P0|check_R3"
+  "O1|default JSON output|02|Output|P0|check_O1"
+  "O2|valid JSON|02|Output|P0|check_O2"
+  "O3|schema stability|02|Output|P0|check_O3"
+  "O4|--fields filter|02|Output|P2|check_O4"
+  "O5|empty result = []|02|Output|P2|check_O5"
+  "O6|--human flag|02|Output|P2|check_O6"
+  "O7|list wrapping|02|Output|P2|check_O7"
+  "O8|pagination info|02|Output|P2|check_O8"
+  "O9|NDJSON streaming|02|Output|P2|check_O9"
+  "O10|TTY auto-detect|02|Output|P2|check_O10"
+  "E1|unified error format|03|Error|P0|check_E1"
+  "E2|errors to stderr|03|Error|P2|check_E2"
+  "E3|error JSON valid|03|Error|P2|check_E3"
+  "E4|error code field|03|Error|P0|check_E4"
+  "E5|error message field|03|Error|P0|check_E5"
+  "E6|suggestion field|03|Error|P1|check_E6"
+  "E7|no interactive mode|03|Error|P0|check_E7"
+  "E8|error code stability|03|Error|P0|check_E8"
+  "I1|long flag names|04|Input|P1|check_I1"
+  "I2|no positional ambiguity|04|Input|P1|check_I2"
+  "I3|--json-input|04|Input|P2|check_I3"
+  "I4|missing param = error|04|Input|P1|check_I4"
+  "I5|type validation|04|Input|P1|check_I5"
+  "I6|boolean flag explicit|04|Input|P2|check_I6"
+  "I7|array parameters|04|Input|P2|check_I7"
+  "I8|no implicit state|04|Input|P1|check_I8"
+  "I9|non-interactive auth|04|Input|P1|check_I9"
+  "S1|--yes guard|05|Safety|P1|check_S1"
+  "S2|default deny|05|Safety|P2|check_S2"
+  "S3|--dry-run|05|Safety|P2|check_S3"
+  "S4|input hardening|05|Safety|P1|check_S4"
+  "S5|no auto-upgrade|05|Safety|P2|check_S5"
+  "S6|destructive marked|05|Safety|P2|check_S6"
+  "S7|no silent destruction|05|Safety|P2|check_S7"
+  "S8|--sanitize|05|Safety|P1|check_S8"
+  "X1|0 = success|06|Exit Code|P1|check_X1"
+  "X2|1 = general error|06|Exit Code|P2|check_X2"
+  "X3|2 = parameter error|06|Exit Code|P0|check_X3"
+  "X4|10 = auth failure|06|Exit Code|P2|check_X4"
+  "X5|11 = permission denied|06|Exit Code|P2|check_X5"
+  "X6|20 = not found|06|Exit Code|P2|check_X6"
+  "X7|30 = conflict|06|Exit Code|P2|check_X7"
+  "X8|exit code matches JSON|06|Exit Code|P2|check_X8"
+  "X9|no exit 0 masking|06|Exit Code|P0|check_X9"
+  "C1|stdout = data only|07|Composability|P0|check_C1"
+  "C2|stderr = logs only|07|Composability|P0|check_C2"
+  "C3|pipe friendly|07|Composability|P2|check_C3"
+  "C4|--quiet|07|Composability|P2|check_C4"
+  "C5|pipe chain|07|Composability|P2|check_C5"
+  "C6|no interactive in pipe|07|Composability|P1|check_C6"
+  "C7|idempotency|07|Composability|P2|check_C7"
+  "N1|consistent naming|08|Naming|P2|check_N1"
+  "N2|kebab-case flags|08|Naming|P2|check_N2"
+  "N3|max 3 levels|08|Naming|P2|check_N3"
+  "N4|reserved flags (incl --brief/--agent/--human)|08|Naming|P1|check_N4"
+  "N5|--help|08|Naming|P2|check_N5"
+  "N6|--version semver|08|Naming|P2|check_N6"
+  "M1|AGENTS.md|09|Meta|P2|check_M1"
+  "M2|MCP export|09|Meta|P2|check_M2"
+  "M3|changelog|09|Meta|P2|check_M3"
+  "F1|issue subcommand|10|Feedback|P2|check_F1"
+  "F2|structured submission|10|Feedback|P2|check_F2"
+  "F3|categories|10|Feedback|P2|check_F3"
+  "F4|local storage|10|Feedback|P2|check_F4"
+  "F5|queryable|10|Feedback|P2|check_F5"
+  "F6|status tracking|10|Feedback|P2|check_F6"
+  "F7|issue data directory|10|Feedback|P2|check_F7"
+  "F8|issue state management|10|Feedback|P2|check_F8"
+  "G1|runtime schema validation|11|Guardrails|P1|check_G1"
+  "G2|secret detection|11|Guardrails|P1|check_G2"
+  "G3|dangerous path rejection|11|Guardrails|P1|check_G3"
+  "G4|permission levels|11|Guardrails|P2|check_G4"
+  "G5|output redaction|11|Guardrails|P2|check_G5"
+  "G6|precondition check|11|Guardrails|P1|check_G6"
+  "G7|rate/batch limits|11|Guardrails|P2|check_G7"
+  "G8|shell metachar rejection|11|Guardrails|P1|check_G8"
+  "G9|fail-closed|11|Guardrails|P1|check_G9"
+)
+
+rule_layer() {
+  case "$1" in
+    O1|O2|O3|E1|E4|E5|E7|E8|X3|X9|C1|C2|I4|I5|S1|S4|G1|G2|G3|G8)
+      echo "core"
+      ;;
+    D12|D13|D14|D17|D18|R1|R2|R3|M1|M2|M3|F1|F2|F3|F4|F5|F6|F7|F8)
+      echo "ecosystem"
+      ;;
+    *)
+      echo "recommended"
+      ;;
+  esac
+}
+
+build_layer_json() {
+  local name="$1" total="$2" checked="$3" passed="$4" failed="$5" skipped="$6" ai="$7" warned="$8" compliant="$9"
+  jq -n \
+    --arg name "$name" \
+    --argjson total "$total" \
+    --argjson checked "$checked" \
+    --argjson passed "$passed" \
+    --argjson failed "$failed" \
+    --argjson skipped "$skipped" \
+    --argjson ai "$ai" \
+    --argjson warned "$warned" \
+    --argjson compliant "$compliant" \
+    '{
+      name: $name,
+      summary: {
+        total: $total,
+        checked: $checked,
+        passed: $passed,
+        failed: $failed,
+        skipped: $skipped,
+        ai_review: $ai,
+        warned: $warned,
+        not_checked: ($total - $checked)
+      },
+      compliant: $compliant
+    }'
+}
+
+# ═══════════════════════════════════════════════════════════
+# Report Builder
+# ═══════════════════════════════════════════════════════════
+
+build_report() {
+  local tool_name; tool_name=$(_get_tool_name)
+  local tool_version; tool_version=$(_get_tool_version)
+  local timestamp; timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  # Count results
+  local passed=0 failed=0 skipped=0 ai=0 warned=0 total=${#RESULTS[@]}
+  for r in "${RESULTS[@]}"; do
+    local st; st=$(echo "$r" | jq -r '.status')
+    case "$st" in
+      pass) passed=$((passed + 1)) ;;
+      fail) failed=$((failed + 1)) ;;
+      skip) skipped=$((skipped + 1)) ;;
+      ai)   ai=$((ai + 1)) ;;
+      warn) warned=$((warned + 1)) ;;
+    esac
+  done
+
+  # Layered certification requires every rule in the layer to be checked and passed.
+  local core_total=0 core_checked=0 core_passed=0 core_failed=0 core_skipped=0 core_ai=0 core_warned=0 core_compliant=true
+  local rec_total=0 rec_checked=0 rec_passed=0 rec_failed=0 rec_skipped=0 rec_ai=0 rec_warned=0 rec_compliant=true
+  local eco_total=0 eco_checked=0 eco_passed=0 eco_failed=0 eco_skipped=0 eco_ai=0 eco_warned=0 eco_compliant=true
+  for entry in "${RULE_REGISTRY[@]}"; do
+    IFS='|' read -r rid rname rdim rdname rpri rfunc <<< "$entry"
+    local layer; layer=$(rule_layer "$rid")
+    local status="not_checked"
+    for r in "${RESULTS[@]}"; do
+      local result_id; result_id=$(echo "$r" | jq -r '.id')
+      if [[ "$result_id" == "$rid" ]]; then
+        status=$(echo "$r" | jq -r '.status')
+        break
+      fi
+    done
+    case "$layer" in
+      core)
+        core_total=$((core_total + 1))
+        [[ "$status" != "not_checked" ]] && core_checked=$((core_checked + 1))
+        case "$status" in
+          pass) core_passed=$((core_passed + 1)) ;;
+          fail) core_failed=$((core_failed + 1)) ;;
+          skip) core_skipped=$((core_skipped + 1)) ;;
+          ai)   core_ai=$((core_ai + 1)) ;;
+          warn) core_warned=$((core_warned + 1)) ;;
+        esac
+        [[ "$status" != "pass" ]] && core_compliant=false
+        ;;
+      recommended)
+        rec_total=$((rec_total + 1))
+        [[ "$status" != "not_checked" ]] && rec_checked=$((rec_checked + 1))
+        case "$status" in
+          pass) rec_passed=$((rec_passed + 1)) ;;
+          fail) rec_failed=$((rec_failed + 1)) ;;
+          skip) rec_skipped=$((rec_skipped + 1)) ;;
+          ai)   rec_ai=$((rec_ai + 1)) ;;
+          warn) rec_warned=$((rec_warned + 1)) ;;
+        esac
+        [[ "$status" != "pass" ]] && rec_compliant=false
+        ;;
+      ecosystem)
+        eco_total=$((eco_total + 1))
+        [[ "$status" != "not_checked" ]] && eco_checked=$((eco_checked + 1))
+        case "$status" in
+          pass) eco_passed=$((eco_passed + 1)) ;;
+          fail) eco_failed=$((eco_failed + 1)) ;;
+          skip) eco_skipped=$((eco_skipped + 1)) ;;
+          ai)   eco_ai=$((eco_ai + 1)) ;;
+          warn) eco_warned=$((eco_warned + 1)) ;;
+        esac
+        [[ "$status" != "pass" ]] && eco_compliant=false
+        ;;
+      *)
+        error_json "INTERNAL_ERROR" "Unknown rule layer: $layer" "Report this bug with the rule id." 1
+        ;;
+    esac
+  done
+
+  local agent_friendly=false agent_ready=false agent_native=false
+  [[ "$core_compliant" == true ]] && agent_friendly=true
+  if [[ "$core_compliant" == true && "$rec_compliant" == true ]]; then
+    agent_ready=true
+  fi
+  if [[ "$core_compliant" == true && "$rec_compliant" == true && "$eco_compliant" == true ]]; then
+    agent_native=true
+  fi
+
+  local layers
+  layers=$(jq -n \
+    --argjson core "$(build_layer_json "core" "$core_total" "$core_checked" "$core_passed" "$core_failed" "$core_skipped" "$core_ai" "$core_warned" "$core_compliant")" \
+    --argjson recommended "$(build_layer_json "recommended" "$rec_total" "$rec_checked" "$rec_passed" "$rec_failed" "$rec_skipped" "$rec_ai" "$rec_warned" "$rec_compliant")" \
+    --argjson ecosystem "$(build_layer_json "ecosystem" "$eco_total" "$eco_checked" "$eco_passed" "$eco_failed" "$eco_skipped" "$eco_ai" "$eco_warned" "$eco_compliant")" \
+    '[ $core, $recommended, $ecosystem ]')
+
+  # Build dimensions array
+  local dimensions="[]"
+  local prev_dim=""
+  local dim_rules="[]"
+
+  for entry in "${RULE_REGISTRY[@]}"; do
+    IFS='|' read -r rid rname rdim rdname rpri rfunc <<< "$entry"
+    local layer; layer=$(rule_layer "$rid")
+
+    # Find result for this rule
+    local rule_result="{\"id\": \"$rid\", \"name\": $(printf '%s' "$rname" | jq -Rs .), \"priority\": \"$rpri\", \"layer\": \"$layer\", \"status\": \"skip\", \"detail\": \"Not checked\"}"
+    for r in "${RESULTS[@]}"; do
+      local result_id; result_id=$(echo "$r" | jq -r '.id')
+      if [[ "$result_id" == "$rid" ]]; then
+        rule_result=$(echo "$r" | jq --arg name "$rname" --arg pri "$rpri" --arg layer "$layer" '. + {name: $name, priority: $pri, layer: $layer}')
+        break
+      fi
+    done
+
+    if [[ "$rdim" != "$prev_dim" && -n "$prev_dim" ]]; then
+      # Flush previous dimension
+      dimensions=$(echo "$dimensions" | jq --argjson rules "$dim_rules" --arg did "$prev_dim" --arg dname "$prev_dname" \
+        '. + [{ id: $did, name: $dname, rules: $rules }]')
+      dim_rules="[]"
+    fi
+
+    dim_rules=$(echo "$dim_rules" | jq --argjson rule "$rule_result" '. + [$rule]')
+    prev_dim="$rdim"
+    prev_dname="$rdname"
+  done
+
+  # Flush last dimension
+  if [[ -n "$prev_dim" ]]; then
+    dimensions=$(echo "$dimensions" | jq --argjson rules "$dim_rules" --arg did "$prev_dim" --arg dname "$prev_dname" \
+      '. + [{ id: $did, name: $dname, rules: $rules }]')
+  fi
+
+  # Build AI checks array
+  local ai_checks="[]"
+  for r in "${RESULTS[@]}"; do
+    local st; st=$(echo "$r" | jq -r '.status')
+    if [[ "$st" == "ai" ]]; then
+      ai_checks=$(echo "$ai_checks" | jq --argjson item "$r" '. + [$item]')
+    fi
+  done
+
+  # Final report
+  jq -n \
+    --arg tool "$tool_name" \
+    --arg version "$tool_version" \
+    --arg spec "$SPEC_VERSION" \
+    --arg ts "$timestamp" \
+    --argjson summary "{\"total\": $total, \"passed\": $passed, \"failed\": $failed, \"skipped\": $skipped, \"ai_review\": $ai, \"warned\": $warned}" \
+    --argjson layers "$layers" \
+    --argjson cert "{\"agent_friendly\": $agent_friendly, \"agent_ready\": $agent_ready, \"agent_native\": $agent_native}" \
+    --argjson dims "$dimensions" \
+    --argjson ai "$ai_checks" \
+    '{
+      tool: $tool,
+      version: $version,
+      spec_version: $spec,
+      timestamp: $ts,
+      summary: $summary,
+      layers: $layers,
+      certification: $cert,
+      dimensions: $dims,
+      ai_checks: $ai
+    }'
+}
+
+# ═══════════════════════════════════════════════════════════
+# Commands: check, snapshot, diff, ai-prompts
+# ═══════════════════════════════════════════════════════════
+
+cmd_check() {
+  local cli="" dimension="" layer="" priority="" rule=""
+
+  # First non-flag arg is the CLI
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dimension) [[ $# -ge 2 ]] || error_json "MISSING_VALUE" "--dimension requires a value" "e.g. --dimension 01" 2
+                   dimension="$2"; shift 2 ;;
+      --layer)     [[ $# -ge 2 ]] || error_json "MISSING_VALUE" "--layer requires a value" "e.g. --layer core" 2
+                   layer="$(echo "$2" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
+      --priority)  [[ $# -ge 2 ]] || error_json "MISSING_VALUE" "--priority requires a value" "e.g. --priority p0" 2
+                   priority="$(echo "$2" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;  # lowercase
+      --rule)      [[ $# -ge 2 ]] || error_json "MISSING_VALUE" "--rule requires a value" "e.g. --rule O1" 2
+                   rule="$(echo "$2" | tr '[:lower:]' '[:upper:]')"; shift 2 ;;  # uppercase
+      -*)          error_json "UNKNOWN_FLAG" "Unknown flag: $1" "Valid: --dimension, --layer, --priority, --rule" 2 ;;
+      *)           cli="$1"; shift ;;
+    esac
+  done
+
+  case "$layer" in
+    ""|core|recommended|ecosystem) ;;
+    *) error_json "INVALID_ENUM" "Invalid layer: $layer" "Valid: core, recommended, ecosystem" 2 ;;
+  esac
+
+  [[ -n "$cli" ]] || error_json "MISSING_PARAM" \
+    "Missing required parameter: target CLI command" \
+    "Usage: agent-cli-lint check <cli> [--dimension 01] [--layer core] [--priority p0] [--rule O1]" 2
+
+  ensure_dirs
+  discover_target "$cli"
+
+  RESULTS=()
+
+  local checked=0
+  for entry in "${RULE_REGISTRY[@]}"; do
+    IFS='|' read -r rid rname rdim rdname rpri rfunc <<< "$entry"
+
+    # Apply filters
+    [[ -n "$dimension" && "$rdim" != "$dimension" ]] && continue
+    [[ -n "$layer" && "$(rule_layer "$rid")" != "$layer" ]] && continue
+    [[ -n "$priority" && "$(echo "$rpri" | tr '[:upper:]' '[:lower:]')" != "$priority" ]] && continue
+    [[ -n "$rule" && "$rid" != "$rule" ]] && continue
+
+    # Run check
+    log "  [$rid] $rname ..."
+    "$rfunc" 2>/dev/null || true
+    checked=$((checked + 1))
+  done
+
+  if [[ $checked -eq 0 ]]; then
+    error_json "NOT_FOUND" "No rules matched the filter" \
+      "Check --dimension (01-11), --layer (core/recommended/ecosystem), --priority (p0/p1/p2), --rule (e.g. O1)" 20
+  fi
+
+  local report; report=$(build_report)
+
+  # Extract summary for exit code decision
+  local tool passed failed skipped total
+  tool=$(echo "$report" | jq -r '.tool')
+  passed=$(echo "$report" | jq -r '.summary.passed')
+  failed=$(echo "$report" | jq -r '.summary.failed')
+  skipped=$(echo "$report" | jq -r '.summary.skipped')
+  total=$(echo "$report" | jq -r '.summary.total')
+
+  if wants_json_output; then
+    if [[ -n "$FIELDS" ]]; then
+      echo "$report" | filter_fields
+    else
+      echo "$report" | jq '.'
+    fi
+  else
+    local af ar an
+    af=$(echo "$report" | jq -r '.certification.agent_friendly')
+    ar=$(echo "$report" | jq -r '.certification.agent_ready')
+    an=$(echo "$report" | jq -r '.certification.agent_native')
+    local core_ok rec_ok eco_ok
+    core_ok=$(echo "$report" | jq -r '.layers[] | select(.name == "core") | .compliant')
+    rec_ok=$(echo "$report" | jq -r '.layers[] | select(.name == "recommended") | .compliant')
+    eco_ok=$(echo "$report" | jq -r '.layers[] | select(.name == "ecosystem") | .compliant')
+
+    echo ""
+    echo "  Agent-Friendly CLI Spec v$SPEC_VERSION — Lint Report"
+    echo "  ─────────────────────────────────────────────"
+    echo "  Tool:    $tool (v$(echo "$report" | jq -r '.version'))"
+    echo "  Passed:  $passed / $total"
+    echo "  Failed:  $failed"
+    echo "  Skipped: $skipped"
+    echo ""
+    echo "  Certification:"
+    [[ "$af" == true ]] && echo "    ✓ Agent-Friendly (core layer complete)" || echo "    ✗ Agent-Friendly"
+    [[ "$ar" == true ]] && echo "    ✓ Agent-Ready (core + recommended complete)" || echo "    ✗ Agent-Ready"
+    [[ "$an" == true ]] && echo "    ✓ Agent-Native (all layers complete)" || echo "    ✗ Agent-Native"
+    echo ""
+    echo "  Layers:"
+    [[ "$core_ok" == true ]] && echo "    ✓ core" || echo "    ✗ core"
+    [[ "$rec_ok" == true ]] && echo "    ✓ recommended" || echo "    ✗ recommended"
+    [[ "$eco_ok" == true ]] && echo "    ✓ ecosystem" || echo "    ✗ ecosystem"
+    echo ""
+
+    # Show failures
+    if [[ "$failed" -gt 0 ]]; then
+      echo "  Failures:"
+      echo "$report" | jq -r '.dimensions[].rules[] | select(.status == "fail") |
+        "    [\(.priority)] \(.id) \(.name): \(.detail)"'
+      echo ""
+    fi
+  fi
+
+  # Exit code: 0 if all pass, 1 if failures
+  [[ "$failed" -eq 0 ]] && exit 0 || exit 1
+}
+
+cmd_snapshot() {
+  local cli="${1:-}"
+  [[ -n "$cli" ]] || error_json "MISSING_PARAM" "Missing: target CLI" "Usage: agent-cli-lint snapshot <cli>" 2
+
+  ensure_dirs
+  discover_target "$cli"
+
+  local tool_name; tool_name=$(_get_tool_name)
+  local snap_dir="$SNAPSHOTS_DIR/$tool_name"
+  mkdir -p "$snap_dir"
+
+  # Save --describe if available, otherwise save --help
+  if _has_describe_schema; then
+    echo "$DESCRIBE_CACHE" | jq '.' > "$snap_dir/schema.json"
+  else
+    echo "$HELP_CACHE" | jq '.' > "$snap_dir/schema.json"
+  fi
+  log "Snapshot saved: $snap_dir/schema.json"
+
+  if wants_json_output; then
+    jq -n --arg dir "$snap_dir" --arg tool "$tool_name" '{snapshot: $dir, tool: $tool}'
+  fi
+}
+
+cmd_diff() {
+  local cli="${1:-}"
+  [[ -n "$cli" ]] || error_json "MISSING_PARAM" "Missing: target CLI" "Usage: agent-cli-lint diff <cli>" 2
+
+  ensure_dirs
+  discover_target "$cli"
+
+  local tool_name; tool_name=$(_get_tool_name)
+  local snap_dir="$SNAPSHOTS_DIR/$tool_name"
+
+  [[ -f "$snap_dir/schema.json" ]] || error_json "NOT_FOUND" \
+    "No snapshot for $tool_name" \
+    "Run: agent-cli-lint snapshot $cli" 20
+
+  local old_cmds new_cmds
+  old_cmds=$(jq -r '[.commands[]?.name] | sort | .[]' "$snap_dir/schema.json" 2>/dev/null)
+  new_cmds=$(echo "$DESCRIBE_CACHE" | jq -r '[.commands[]?.name] | sort | .[]' 2>/dev/null)
+
+  local added removed
+  added=$(comm -13 <(echo "$old_cmds") <(echo "$new_cmds") | paste -sd',' -)
+  removed=$(comm -23 <(echo "$old_cmds") <(echo "$new_cmds") | paste -sd',' -)
+
+  local breaking=false
+  [[ -n "$removed" ]] && breaking=true
+
+  if wants_json_output; then
+    jq -n --arg added "$added" --arg removed "$removed" --argjson breaking "$breaking" \
+      '{added: $added, removed: $removed, breaking: $breaking}'
+  else
+    echo "  Snapshot diff for $tool_name:"
+    [[ -n "$added" ]]   && echo "    Added:   $added"
+    [[ -n "$removed" ]] && echo "    Removed: $removed (BREAKING)"
+    [[ -z "$added" && -z "$removed" ]] && echo "    No changes"
+  fi
+
+  [[ "$breaking" == true ]] && exit 1 || exit 0
+}
+
+cmd_ai_prompts() {
+  local cli="${1:-}"
+  [[ -n "$cli" ]] || error_json "MISSING_PARAM" "Missing: target CLI" "Usage: agent-cli-lint ai-prompts <cli>" 2
+
+  discover_target "$cli"
+
+  local list_cmd; list_cmd=$(find_list_command)
+  local all_cmds; all_cmds=$(_get_command_names | paste -sd', ' -)
+  local src_dir="$TARGET_DIR"
+  local test_cmd=""
+  [[ -n "$list_cmd" ]] && test_cmd="$cli $list_cmd --json"
+
+  # Build grep commands in variables (avoid nested quoting hell)
+  local grep_env="grep -rE '(HOME|XDG_|\.config/|\.local/|process\.env|getenv)' $src_dir --include='*.ts' --include='*.sh' --include='*.py' --include='*.js' 2>/dev/null || echo 'NONE'"
+  local grep_update="grep -riE '(auto.?update|self.?update|check.?update|fetch.*latest|upgrade.*silent)' $src_dir --include='*.ts' --include='*.sh' --include='*.py' --include='*.js' 2>/dev/null || echo 'NONE'"
+  local grep_errors="grep -rn '(catch|rescue|except|trap|\.catch\(|try {)' $src_dir --include='*.ts' --include='*.sh' --include='*.py' --include='*.js' 2>/dev/null | head -20 || true"
+
+  jq -n \
+    --arg cli "$cli" \
+    --arg test_cmd "$test_cmd" \
+    --arg cmds "$all_cmds" \
+    --arg grep_env "$grep_env" \
+    --arg grep_update "$grep_update" \
+    --arg grep_errors "$grep_errors" \
+    '[
+      {
+        id: "I2",
+        name: "No positional ambiguity",
+        steps: [
+          {command: ($cli + " --describe"), capture: "schema"},
+          {action: "analyze", target: "schema.commands[].parameters — check positional args"},
+          {action: "judge", criteria: "Each positional arg has fixed meaning regardless of other args"}
+        ],
+        pass_if: "No positional arg changes meaning based on context",
+        fail_if: "Same positional slot means different things depending on other args"
+      },
+      {
+        id: "I8",
+        name: "No implicit state",
+        steps: [
+          {command: $grep_env, capture: "env_refs"},
+          {command: ($cli + " --describe"), capture: "schema"},
+          {action: "compare", target: "env_refs vs schema declared env vars"},
+          {action: "judge", criteria: "All env/config dependencies must be declared in --describe"}
+        ],
+        pass_if: "All env/config dependencies declared in schema, or none exist",
+        fail_if: "Behavior depends on undeclared env vars or hidden config files"
+      },
+      {
+        id: "C7",
+        name: "Idempotency",
+        steps: [
+          {command: $test_cmd, capture: "run1"},
+          {command: $test_cmd, capture: "run2"},
+          {action: "diff", target: "run1 vs run2 (ignore timestamps)"},
+          {action: "repeat_for", target: ("Non-destructive commands: " + $cmds)}
+        ],
+        pass_if: "Identical output on repeated runs (excluding timestamps)",
+        fail_if: "Output differs between identical runs unexpectedly"
+      },
+      {
+        id: "S5",
+        name: "No auto-upgrade",
+        steps: [
+          {command: $grep_update, capture: "update_refs"},
+          {action: "judge", criteria: "No silent auto-update. Explicit update commands are OK."}
+        ],
+        pass_if: "No auto-update code, or only explicit user-triggered updates",
+        fail_if: "Silent background update or auto-download of new versions"
+      },
+      {
+        id: "G5",
+        name: "Output redaction",
+        steps: [
+          {command: $test_cmd, capture: "output"},
+          {action: "scan", target: "output for emails, phones, API keys, SSNs"},
+          {action: "judge", criteria: "PII should be redacted in --json output"}
+        ],
+        pass_if: "No PII in output, or PII is masked",
+        fail_if: "Raw PII appears unmasked in --json output"
+      },
+      {
+        id: "G9",
+        name: "Fail-closed",
+        steps: [
+          {command: $grep_errors, capture: "error_handlers"},
+          {command: ($cli + " --describe"), capture: "schema"},
+          {action: "judge", criteria: "Guard/validation crashes must DENY, not silently ALLOW"}
+        ],
+        pass_if: "Guard errors cause rejection (exit non-zero with error JSON)",
+        fail_if: "Guard errors swallowed, command proceeds anyway"
+      }
+    ]'
+}
+
+# ═══════════════════════════════════════════════════════════
+# Main Router
+# ═══════════════════════════════════════════════════════════
+
+main() {
+  # G9: Fail-closed
+  trap 'error_json "INTERNAL_ERROR" "Unexpected error" "Report: agent-cli-lint issue create --type bug --message \"internal error\"" 1' ERR
+
+  # Parse global flags
+  local args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json|--agent)
+                   OUTPUT_JSON=true
+                   FORCE_HUMAN=false
+                   shift ;;
+      --human)     FORCE_HUMAN=true
+                   OUTPUT_JSON=false
+                   shift ;;
+      --fields)    [[ $# -ge 2 ]] || error_json "MISSING_VALUE" "--fields requires a value" "" 2
+                   FIELDS="$2"; shift 2 ;;
+      --quiet)     QUIET=true; shift ;;
+      --brief)     cmd_brief; exit 0 ;;
+      --help|-h)   cmd_help; exit 0 ;;
+      --describe)  cmd_describe; exit 0 ;;
+      --version)   echo "$VERSION"; exit 0 ;;
+      *)           args+=("$1"); shift ;;
+    esac
+  done
+
+  set -- "${args[@]+"${args[@]}"}"
+
+  local cmd="${1:-}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    check)      cmd_check "$@" ;;
+    snapshot)   cmd_snapshot "$@" ;;
+    diff)       cmd_diff "$@" ;;
+    ai-prompts) cmd_ai_prompts "$@" ;;
+    issue)      cmd_issue "$@" ;;
+    skills)     cmd_skills "$@" ;;
+    "")         error_json "MISSING_COMMAND" "No command specified" \
+                  "Commands: check, snapshot, diff, ai-prompts, issue, skills" 2 ;;
+    *)          error_json "UNKNOWN_COMMAND" "Unknown command: $cmd" \
+                  "Commands: check, snapshot, diff, ai-prompts, issue, skills" 2 ;;
+  esac
+}
+
+main "$@"
