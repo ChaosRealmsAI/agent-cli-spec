@@ -453,6 +453,7 @@ fn build_describe() -> Value {
                     {"name": "cli", "type": "string", "required": true, "description": "Target CLI command to check"},
                     {"name": "dimension", "type": "string", "required": false, "description": "Filter by dimension (01-11)"},
                     {"name": "layer", "type": "string", "required": false, "enum": ["core", "recommended", "ecosystem"], "description": "Filter by execution layer"},
+                    {"name": "level", "type": "string", "required": false, "enum": ["p0", "p1", "p2", "p3"], "description": "Gate level by priority range: p0, p0+p1, p0+p1+p2, reserved p3"},
                     {"name": "priority", "type": "string", "required": false, "enum": ["p0", "p1", "p2"], "description": "Filter by priority"},
                     {"name": "rule", "type": "string", "required": false, "description": "Check single rule by ID (e.g. O1)"}
                 ],

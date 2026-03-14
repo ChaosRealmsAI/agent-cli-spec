@@ -11,6 +11,11 @@ description: Quick start commands for running agent-cli-lint
 # 检查一个 CLI 的完整合规性
 agent-cli-lint check <cli> --json
 
+# 按门禁等级检查：P0 / P0+P1 / 全部当前优先级
+agent-cli-lint check <cli> --level p0 --json
+agent-cli-lint check <cli> --level p1 --json
+agent-cli-lint check <cli> --level p2 --json
+
 # 只检查 P0 生死线（10 条）
 agent-cli-lint check <cli> --priority p0 --json
 

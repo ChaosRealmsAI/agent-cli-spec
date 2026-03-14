@@ -34,6 +34,7 @@ struct RuleResult {
 struct Filters {
     dimension: String,
     layer: String,
+    level: String,
     priority: String,
     rule: String,
 }
@@ -84,7 +85,7 @@ pub fn cmd_check(ctx: &AppContext, args: &[String]) -> Result<i32, CliError> {
             "NOT_FOUND",
             "No rules matched the filter",
             Some(
-                "Check --dimension (01-11), --layer (core/recommended/ecosystem), --priority (p0/p1/p2), --rule (e.g. O1)",
+                "Check --dimension (01-11), --layer (core/recommended/ecosystem), --level (p0-p3), --priority (p0/p1/p2), --rule (e.g. O1)",
             ),
             20,
         ));
@@ -563,6 +564,7 @@ fn parse_check_args(args: &[String]) -> Result<(String, Filters), CliError> {
     let mut cli = String::new();
     let mut dimension = String::new();
     let mut layer = String::new();
+    let mut level = String::new();
     let mut priority = String::new();
     let mut rule = String::new();
     let mut i = 0usize;
@@ -605,6 +607,18 @@ fn parse_check_args(args: &[String]) -> Result<(String, Filters), CliError> {
                 priority = value.to_lowercase();
                 i += 2;
             }
+            "--level" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    CliError::new(
+                        "MISSING_VALUE",
+                        "--level requires a value",
+                        Some("e.g. --level p1"),
+                        2,
+                    )
+                })?;
+                level = value.to_lowercase();
+                i += 2;
+            }
             "--rule" => {
                 let value = args.get(i + 1).ok_or_else(|| {
                     CliError::new(
@@ -621,7 +635,7 @@ fn parse_check_args(args: &[String]) -> Result<(String, Filters), CliError> {
                 return Err(CliError::new(
                     "UNKNOWN_FLAG",
                     format!("Unknown flag: {other}"),
-                    Some("Valid: --dimension, --layer, --priority, --rule"),
+                    Some("Valid: --dimension, --layer, --level, --priority, --rule"),
                     2,
                 ));
             }
@@ -640,12 +654,28 @@ fn parse_check_args(args: &[String]) -> Result<(String, Filters), CliError> {
             2,
         ));
     }
+    if !level.is_empty() && !matches!(level.as_str(), "p0" | "p1" | "p2" | "p3") {
+        return Err(CliError::new(
+            "INVALID_ENUM",
+            format!("Invalid level: {level}"),
+            Some("Valid: p0, p1, p2, p3"),
+            2,
+        ));
+    }
+    if !priority.is_empty() && !matches!(priority.as_str(), "p0" | "p1" | "p2") {
+        return Err(CliError::new(
+            "INVALID_ENUM",
+            format!("Invalid priority: {priority}"),
+            Some("Valid: p0, p1, p2"),
+            2,
+        ));
+    }
     if cli.is_empty() {
         return Err(CliError::new(
             "MISSING_PARAM",
             "Missing required parameter: target CLI command",
             Some(
-                "Usage: agent-cli-lint check <cli> [--dimension 01] [--layer core] [--priority p0] [--rule O1]",
+                "Usage: agent-cli-lint check <cli> [--dimension 01] [--layer core] [--level p1] [--priority p0] [--rule O1]",
             ),
             2,
         ));
@@ -656,6 +686,7 @@ fn parse_check_args(args: &[String]) -> Result<(String, Filters), CliError> {
         Filters {
             dimension,
             layer,
+            level,
             priority,
             rule,
         },
@@ -698,6 +729,19 @@ fn validate_rule_filters(registry: &[RuleMeta], filters: &Filters) -> Result<(),
                 filters.priority
             ),
             Some("Remove either --rule or --priority."),
+            2,
+        ));
+    }
+    if !filters.level.is_empty() && !level_allows_priority(&filters.level, &rule.priority) {
+        return Err(CliError::new(
+            "FILTER_CONFLICT",
+            format!(
+                "Rule {} has priority {}, outside level {}",
+                filters.rule,
+                rule.priority.to_lowercase(),
+                filters.level
+            ),
+            Some("Remove either --rule or --level."),
             2,
         ));
     }
@@ -755,8 +799,23 @@ fn load_rule_registry(root_dir: &Path) -> Result<Vec<RuleMeta>, CliError> {
 fn matches_filters(rule: &RuleMeta, filters: &Filters) -> bool {
     (filters.dimension.is_empty() || rule.dimension_id == filters.dimension)
         && (filters.layer.is_empty() || rule.layer == filters.layer)
+        && (filters.level.is_empty() || level_allows_priority(&filters.level, &rule.priority))
         && (filters.priority.is_empty() || rule.priority.to_lowercase() == filters.priority)
         && (filters.rule.is_empty() || rule.id == filters.rule)
+}
+
+fn level_allows_priority(level: &str, priority: &str) -> bool {
+    priority_rank(priority) <= priority_rank(level)
+}
+
+fn priority_rank(value: &str) -> i32 {
+    match value.to_lowercase().as_str() {
+        "p0" => 0,
+        "p1" => 1,
+        "p2" => 2,
+        "p3" => 3,
+        _ => 99,
+    }
 }
 
 fn build_report(
@@ -767,6 +826,7 @@ fn build_report(
 ) -> Value {
     let partial = !filters.dimension.is_empty()
         || !filters.layer.is_empty()
+        || !filters.level.is_empty()
         || !filters.priority.is_empty()
         || !filters.rule.is_empty();
     let total = results.len() as i64;
@@ -898,6 +958,7 @@ fn build_report(
             "partial": partial,
             "dimension": filters.dimension,
             "layer": filters.layer,
+            "level": filters.level,
             "priority": filters.priority,
             "rule": filters.rule
         },
