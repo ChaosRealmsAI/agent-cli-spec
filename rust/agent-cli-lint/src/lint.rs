@@ -97,12 +97,12 @@ pub fn cmd_check(ctx: &AppContext, args: &[String]) -> Result<i32, CliError> {
         print_human_report(&report);
     }
 
-    let failed = report
-        .get("summary")
-        .and_then(|value| value.get("failed"))
-        .and_then(Value::as_i64)
-        .unwrap_or(1);
-    Ok(if failed == 0 { 0 } else { 1 })
+    let gate_passed = report
+        .get("gate")
+        .and_then(|value| value.get("passed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(if gate_passed { 0 } else { 1 })
 }
 
 pub fn cmd_snapshot(ctx: &AppContext, args: &[String]) -> Result<i32, CliError> {
@@ -787,6 +787,7 @@ fn build_report(
         .iter()
         .filter(|entry| entry.status == "warn")
         .count() as i64;
+    let gate = build_gate_json(total, passed, failed, skipped, ai, warned);
 
     let layers = ["core", "recommended", "ecosystem"]
         .into_iter()
@@ -908,10 +909,51 @@ fn build_report(
             "ai_review": ai,
             "warned": warned
         },
+        "gate": gate,
         "layers": layers,
         "certification": certification,
         "dimensions": dimensions,
         "ai_checks": ai_checks
+    })
+}
+
+fn build_gate_json(
+    total: i64,
+    passed: i64,
+    failed: i64,
+    skipped: i64,
+    ai: i64,
+    warned: i64,
+) -> Value {
+    let gate_passed = total > 0 && passed == total;
+    let mut blockers = Vec::new();
+    if failed > 0 {
+        blockers.push(format!("{failed} failed"));
+    }
+    if skipped > 0 {
+        blockers.push(format!("{skipped} skipped"));
+    }
+    if ai > 0 {
+        blockers.push(format!("{ai} ai_review"));
+    }
+    if warned > 0 {
+        blockers.push(format!("{warned} warned"));
+    }
+    let reason = if gate_passed {
+        "All selected rules passed.".to_string()
+    } else if blockers.is_empty() {
+        "No rules were selected.".to_string()
+    } else {
+        format!(
+            "Development gate requires every selected rule to pass; blockers: {}.",
+            blockers.join(", ")
+        )
+    };
+    json!({
+        "mode": "development",
+        "strict": true,
+        "passed": gate_passed,
+        "reason": reason
     })
 }
 
@@ -1004,10 +1046,26 @@ fn print_human_report(report: &Value) {
         .pointer("/summary/total")
         .and_then(Value::as_i64)
         .unwrap_or(0);
+    let ai = report
+        .pointer("/summary/ai_review")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let warned = report
+        .pointer("/summary/warned")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     let partial = report
         .pointer("/scope/partial")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let gate_passed = report
+        .pointer("/gate/passed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let gate_reason = report
+        .pointer("/gate/reason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
 
     println!();
     println!(
@@ -1023,8 +1081,14 @@ fn print_human_report(report: &Value) {
     println!("  Passed:  {passed} / {total}");
     println!("  Failed:  {failed}");
     println!("  Skipped: {skipped}");
+    println!("  AI:      {ai}");
+    println!("  Warned:  {warned}");
+    println!("  Gate:    {}", if gate_passed { "PASS" } else { "FAIL" });
     if partial {
         println!("  Scope:   partial report");
+    }
+    if !gate_reason.is_empty() {
+        println!("  Reason:  {gate_reason}");
     }
     println!();
 }

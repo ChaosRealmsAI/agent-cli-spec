@@ -420,7 +420,7 @@ fn build_help(ctx: &AppContext) -> Result<Value, CliError> {
         "help": agent::read_brief(&ctx.root_dir)?,
         "version": VERSION,
         "commands": [
-            {"name": "check", "description": "Check CLI compliance against spec rules"},
+            {"name": "check", "description": "Run strict compliance gate; every selected rule must pass"},
             {"name": "snapshot", "description": "Save schema and error code snapshot"},
             {"name": "diff", "description": "Compare current vs saved snapshot"},
             {"name": "ai-prompts", "description": "Generate AI check prompts for non-automatable rules"},
@@ -446,7 +446,7 @@ fn build_describe() -> Value {
         "commands": [
             {
                 "name": "check",
-                "description": "Check CLI compliance against 98 rules",
+                "description": "Run strict compliance gate across 98 rules; every selected rule must pass",
                 "destructive": false,
                 "permission": "read",
                 "parameters": [
@@ -456,7 +456,7 @@ fn build_describe() -> Value {
                     {"name": "priority", "type": "string", "required": false, "enum": ["p0", "p1", "p2"], "description": "Filter by priority"},
                     {"name": "rule", "type": "string", "required": false, "description": "Check single rule by ID (e.g. O1)"}
                 ],
-                "output": {"type": "object", "properties": {"tool": "string", "scope": "object", "summary": "object", "layers": "array", "certification": "object", "dimensions": "array"}}
+                "output": {"type": "object", "properties": {"tool": "string", "scope": "object", "summary": "object", "gate": "object", "layers": "array", "certification": "object", "dimensions": "array"}}
             },
             {
                 "name": "snapshot",
@@ -504,7 +504,7 @@ fn build_describe() -> Value {
         "global_flags": ["--agent", "--human", "--brief", "--help", "--version", "--fields", "--quiet"],
         "exit_codes": {
             "0": "Success (all checked rules pass)",
-            "1": "Lint failures found or general error",
+            "1": "Strict gate failed (any selected rule is fail/skip/ai/warn) or general error",
             "2": "Usage/parameter error",
             "20": "Resource not found"
         }
