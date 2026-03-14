@@ -512,19 +512,7 @@ fn build_describe() -> Value {
 }
 
 fn repo_root() -> Result<PathBuf, CliError> {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            CliError::new(
-                "INTERNAL_ERROR",
-                "Failed to resolve repository root",
-                Some("Run from the checked-out repository."),
-                1,
-            )
-        })
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf())
 }
 
 #[allow(dead_code)]

@@ -8,8 +8,8 @@ Archived material kept for reference but not part of the active product surface.
 
 The active repository surface is now centered on:
 
-- `agent-cli-lint`
-- `rust/agent-cli-lint`
+- `agent-cli-lint/`
 - `skills/`
-- `agent/`
-- `data/`
+
+The Rust implementation, rule registry, and agent metadata now live inside
+`agent-cli-lint/`.
