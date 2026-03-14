@@ -1,6 +1,6 @@
 mod agent;
-mod compat;
 mod issue;
+mod lint;
 mod output;
 
 use std::env;
@@ -30,7 +30,10 @@ enum CommandSpec {
     Version,
     Skills { name: Option<String> },
     Issue(IssueCommand),
-    Legacy(Vec<String>),
+    Check(Vec<String>),
+    Snapshot(Vec<String>),
+    Diff(Vec<String>),
+    AiPrompts(Vec<String>),
 }
 
 #[derive(Clone, Debug)]
@@ -43,7 +46,9 @@ enum IssueCommand {
 #[derive(Clone, Debug)]
 struct AppContext {
     root_dir: PathBuf,
+    lint_dir: PathBuf,
     issues_dir: PathBuf,
+    snapshots_dir: PathBuf,
     global: GlobalOptions,
 }
 
@@ -62,10 +67,13 @@ impl AppContext {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(home).join(".agent-cli-lint"));
         let issues_dir = lint_dir.join("issues");
+        let snapshots_dir = lint_dir.join("snapshots");
 
         Ok(Self {
             root_dir,
+            lint_dir,
             issues_dir,
+            snapshots_dir,
             global,
         })
     }
@@ -81,14 +89,16 @@ impl AppContext {
     }
 
     fn ensure_dirs(&self) -> Result<(), CliError> {
-        fs::create_dir_all(&self.issues_dir).map_err(|err| {
-            CliError::new(
-                "INTERNAL_ERROR",
-                format!("Failed to create {}: {err}", self.issues_dir.display()),
-                Some("Check directory permissions."),
-                1,
-            )
-        })
+        fs::create_dir_all(&self.issues_dir)
+            .and_then(|_| fs::create_dir_all(&self.snapshots_dir))
+            .map_err(|err| {
+                CliError::new(
+                    "INTERNAL_ERROR",
+                    format!("Failed to create {}: {err}", self.lint_dir.display()),
+                    Some("Check directory permissions."),
+                    1,
+                )
+            })
     }
 
     fn log(&self, message: &str) {
@@ -145,7 +155,10 @@ fn run() -> Result<i32, CliError> {
             Ok(0)
         }
         CommandSpec::Issue(issue_cmd) => handle_issue(&ctx, issue_cmd),
-        CommandSpec::Legacy(args) => compat::delegate_to_legacy(&ctx.root_dir, &args),
+        CommandSpec::Check(args) => lint::cmd_check(&ctx, &args),
+        CommandSpec::Snapshot(args) => lint::cmd_snapshot(&ctx, &args),
+        CommandSpec::Diff(args) => lint::cmd_diff(&ctx, &args),
+        CommandSpec::AiPrompts(args) => lint::cmd_ai_prompts(&ctx, &args),
     }
 }
 
@@ -216,7 +229,10 @@ fn parse_args(args: &[String]) -> Result<(GlobalOptions, CommandSpec), CliError>
             },
         )),
         "issue" => Ok((global, CommandSpec::Issue(parse_issue_args(&rest[1..])?))),
-        "check" | "snapshot" | "diff" | "ai-prompts" => Ok((global, CommandSpec::Legacy(rest))),
+        "check" => Ok((global, CommandSpec::Check(rest[1..].to_vec()))),
+        "snapshot" => Ok((global, CommandSpec::Snapshot(rest[1..].to_vec()))),
+        "diff" => Ok((global, CommandSpec::Diff(rest[1..].to_vec()))),
+        "ai-prompts" => Ok((global, CommandSpec::AiPrompts(rest[1..].to_vec()))),
         _ => Err(CliError::new(
             "UNKNOWN_COMMAND",
             format!("Unknown command: {command}"),
@@ -552,7 +568,8 @@ mod tests {
 
     #[test]
     fn rejects_shell_metacharacters_in_issue_message() {
-        let error = validate_issue_input("bug", "oops; rm -rf").expect_err("should reject shell meta");
+        let error =
+            validate_issue_input("bug", "oops; rm -rf").expect_err("should reject shell meta");
         assert_eq!(error.code, "SHELL_INJECTION");
     }
 }
