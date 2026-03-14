@@ -9,6 +9,7 @@ LINT_DIR="${AGENT_CLI_LINT_DIR:-$HOME/.agent-cli-lint}"
 ISSUES_DIR="$LINT_DIR/issues"
 SNAPSHOTS_DIR="$LINT_DIR/snapshots"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RULES_FILE="$SCRIPT_DIR/data/rules.tsv"
 
 # ═══════════════════════════════════════════════════════════
 # D07 Composability: stderr for logs, stdout for data only
@@ -485,6 +486,18 @@ emit_result() {
   RESULTS+=("{\"id\": \"$id\", \"status\": \"$status\", \"detail\": $(printf '%s' "$detail" | jq -Rs .)$sug_field}")
 }
 
+declare -a RULE_REGISTRY=()
+
+load_rule_registry() {
+  RULE_REGISTRY=()
+  [[ -f "$RULES_FILE" ]] || error_json "INTERNAL_ERROR" "Missing rule registry: $RULES_FILE" "Restore data/rules.tsv." 1
+
+  while IFS='|' read -r rid rname rdim rdname rpri rlayer rfunc; do
+    [[ -z "$rid" || "$rid" == \#* ]] && continue
+    RULE_REGISTRY+=("$rid|$rname|$rdim|$rdname|$rpri|$rlayer|$rfunc")
+  done < "$RULES_FILE"
+}
+
 # Filter compiler/runtime noise from stderr mixed into stdout
 # Handles: cargo (Compiling/Finished/Running/Blocking/Downloading/warning:),
 #           bun ($ prefix lines), and other build tool noise
@@ -708,6 +721,48 @@ run_cli() {
   return 0
 }
 
+LIST_CMD=""
+
+require_list_command() {
+  local rule_id="$1" skip_detail="$2"
+  LIST_CMD=$(find_list_command)
+  if [[ -z "$LIST_CMD" ]]; then
+    emit_result "$rule_id" "skip" "$skip_detail"
+    return 1
+  fi
+  return 0
+}
+
+run_list_command() {
+  local args="${1:-}"
+  if [[ -n "$args" ]]; then
+    run_cli "$LIST_CMD $args"
+  else
+    run_cli "$LIST_CMD"
+  fi
+}
+
+stdout_is_json() {
+  echo "$RUN_STDOUT" | jq . >/dev/null 2>&1
+}
+
+ERROR_SOURCE=""
+
+capture_error_probe() {
+  run_cli "--nonexistent-flag-xyz"
+  ERROR_SOURCE="$RUN_STDERR"
+  [[ -z "$ERROR_SOURCE" ]] && ERROR_SOURCE="$RUN_STDOUT"
+  if [[ -n "$ERROR_SOURCE" ]]; then
+    return 0
+  fi
+
+  run_cli "" 2>/dev/null
+  ERROR_SOURCE="$RUN_STDERR"
+  [[ -z "$ERROR_SOURCE" ]] && ERROR_SOURCE="$RUN_STDOUT"
+}
+
+load_rule_registry
+
 # ═══════════════════════════════════════════════════════════
 # 89 Check Functions — Dimension 01: Discoverability
 # ═══════════════════════════════════════════════════════════
@@ -926,13 +981,9 @@ check_D14() {
 # ═══════════════════════════════════════════════════════════
 
 check_O1() {
-  local cmd; cmd=$(find_list_command)
-  if [[ -z "$cmd" ]]; then
-    emit_result "O1" "skip" "No list-like command found to test default output"
-    return
-  fi
-  run_cli "$cmd"
-  if echo "$RUN_STDOUT" | jq . >/dev/null 2>&1; then
+  require_list_command "O1" "No list-like command found to test default output" || return
+  run_list_command
+  if stdout_is_json; then
     emit_result "O1" "pass" "Default output is valid JSON (agent-first)"
   else
     emit_result "O1" "fail" "Default output is not JSON" \
@@ -941,13 +992,9 @@ check_O1() {
 }
 
 check_O2() {
-  local cmd; cmd=$(find_list_command)
-  if [[ -z "$cmd" ]]; then
-    emit_result "O2" "skip" "No command found to test JSON validity"
-    return
-  fi
-  run_cli "$cmd"
-  if echo "$RUN_STDOUT" | jq . >/dev/null 2>&1; then
+  require_list_command "O2" "No command found to test JSON validity" || return
+  run_list_command
+  if stdout_is_json; then
     emit_result "O2" "pass" "Default output is valid JSON"
   else
     emit_result "O2" "fail" "Default output fails jq . validation" \
@@ -975,19 +1022,15 @@ check_O3() {
 }
 
 check_O4() {
-  local cmd; cmd=$(find_list_command)
-  if [[ -z "$cmd" ]]; then
-    emit_result "O4" "skip" "No command found to test --fields"
-    return
-  fi
-  run_cli "$cmd --fields name"
+  require_list_command "O4" "No command found to test --fields" || return
+  run_list_command "--fields name"
   if [[ "$RUN_EXIT" -eq 0 ]]; then
-    emit_result "O4" "pass" "--fields flag accepted on $cmd"
+    emit_result "O4" "pass" "--fields flag accepted on $LIST_CMD"
   else
     # Try base command to see if it works without --fields
-    run_cli "$cmd"
+    run_list_command
     if [[ "$RUN_EXIT" -eq 0 ]]; then
-      emit_result "O4" "fail" "--fields flag not supported on $cmd" \
+      emit_result "O4" "fail" "--fields flag not supported on $LIST_CMD" \
         "Add --fields flag for field filtering."
     else
       emit_result "O4" "skip" "Cannot test --fields (command itself fails)"
@@ -997,12 +1040,8 @@ check_O4() {
 
 check_O5() {
   # Empty result should return [] not error
-  local cmd; cmd=$(find_list_command)
-  if [[ -z "$cmd" ]]; then
-    emit_result "O5" "skip" "No list command to test empty results"
-    return
-  fi
-  run_cli "$cmd"
+  require_list_command "O5" "No list command to test empty results" || return
+  run_list_command
   if [[ "$RUN_EXIT" -eq 0 ]]; then
     local result_type; result_type=$(echo "$RUN_STDOUT" | jq -r 'type' 2>/dev/null)
     if [[ "$result_type" == "array" || "$result_type" == "object" ]]; then
@@ -1018,27 +1057,19 @@ check_O5() {
 
 check_O6() {
   # Agent-first: default is JSON, --human switches to human-friendly
-  local cmd; cmd=$(find_list_command)
-  if [[ -z "$cmd" ]]; then
-    emit_result "O6" "skip" "No command to test --human flag"
-    return
-  fi
-  run_cli "$cmd --human"
+  require_list_command "O6" "No command to test --human flag" || return
+  run_list_command "--human"
   if [[ "$RUN_EXIT" -ne 2 ]]; then
-    emit_result "O6" "pass" "--human flag accepted on $cmd"
+    emit_result "O6" "pass" "--human flag accepted on $LIST_CMD"
   else
-    emit_result "O6" "fail" "--human flag not recognized on $cmd" \
+    emit_result "O6" "fail" "--human flag not recognized on $LIST_CMD" \
       "Add --human flag for human-friendly output. Default must be JSON (agent-first)."
   fi
 }
 
 check_O7() {
-  local cmd; cmd=$(find_list_command)
-  if [[ -z "$cmd" ]]; then
-    emit_result "O7" "skip" "No list command to test array wrapping"
-    return
-  fi
-  run_cli "$cmd"
+  require_list_command "O7" "No list command to test array wrapping" || return
+  run_list_command
   # Check if output has array at top level, or has a result/items key with array value
   if echo "$RUN_STDOUT" | jq -e '
     if type == "array" then true
@@ -1054,12 +1085,8 @@ check_O7() {
 }
 
 check_O8() {
-  local cmd; cmd=$(find_list_command)
-  if [[ -z "$cmd" ]]; then
-    emit_result "O8" "skip" "No list command to test pagination"
-    return
-  fi
-  run_cli "$cmd --json"
+  require_list_command "O8" "No list command to test pagination" || return
+  run_list_command "--json"
   if echo "$RUN_STDOUT" | jq -e '.total or .has_more or .showing' >/dev/null 2>&1; then
     emit_result "O8" "pass" "Pagination info present"
   else
@@ -1077,14 +1104,10 @@ check_O9() {
 }
 
 check_O10() {
-  local cmd; cmd=$(find_list_command)
-  if [[ -z "$cmd" ]]; then
-    emit_result "O10" "skip" "No command to test TTY auto-detect"
-    return
-  fi
+  require_list_command "O10" "No command to test TTY auto-detect" || return
   # Pipe to cat (non-TTY), check if output is JSON without --json
   local output
-  output=$(eval "$TARGET_CLI $cmd" 2>/dev/null | cat)
+  output=$(eval "$TARGET_CLI $LIST_CMD" 2>/dev/null | cat)
   if echo "$output" | jq . >/dev/null 2>&1; then
     emit_result "O10" "pass" "Auto-detects pipe mode and outputs JSON"
   else
@@ -1098,19 +1121,8 @@ check_O10() {
 # ═══════════════════════════════════════════════════════════
 
 check_E1() {
-  # Trigger error: try unknown flag first (reliable), then missing required param
-  run_cli "--nonexistent-flag-xyz"
-  local err_source="$RUN_STDERR"
-  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
-  if echo "$err_source" | jq -e '.error and .code and .message' >/dev/null 2>&1; then
-    emit_result "E1" "pass" "Error format: {error, code, message}"
-    return
-  fi
-  # Fallback: try no args
-  run_cli "" 2>/dev/null
-  err_source="$RUN_STDERR"
-  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
-  if echo "$err_source" | jq -e '.error and .code and .message' >/dev/null 2>&1; then
+  capture_error_probe
+  if echo "$ERROR_SOURCE" | jq -e '.error and .code and .message' >/dev/null 2>&1; then
     emit_result "E1" "pass" "Error format: {error, code, message}"
   else
     emit_result "E1" "fail" "Error does not follow {error, code, message} format" \
@@ -1119,51 +1131,30 @@ check_E1() {
 }
 
 check_E2() {
-  run_cli "--nonexistent-flag-xyz"
+  capture_error_probe
   if [[ -n "$RUN_STDERR" ]] && echo "$RUN_STDERR" | jq -e '.error' >/dev/null 2>&1; then
     emit_result "E2" "pass" "Errors go to stderr"
   elif [[ -n "$RUN_STDOUT" ]] && echo "$RUN_STDOUT" | jq -e '.error' >/dev/null 2>&1; then
     emit_result "E2" "fail" "Errors go to stdout instead of stderr" \
       "Write error JSON to stderr, keep stdout for data only."
   else
-    # Fallback: try no args
-    run_cli "" 2>/dev/null
-    if [[ -n "$RUN_STDERR" ]] && echo "$RUN_STDERR" | jq -e '.error' >/dev/null 2>&1; then
-      emit_result "E2" "pass" "Errors go to stderr"
-    elif [[ -n "$RUN_STDOUT" ]] && echo "$RUN_STDOUT" | jq -e '.error' >/dev/null 2>&1; then
-      emit_result "E2" "fail" "Errors go to stdout instead of stderr"
-    else
-      emit_result "E2" "skip" "Could not determine error output channel"
-    fi
+    emit_result "E2" "skip" "Could not determine error output channel"
   fi
 }
 
 check_E3() {
-  run_cli "--nonexistent-flag-xyz"
-  local err_source="$RUN_STDERR"
-  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
-  if echo "$err_source" | jq . >/dev/null 2>&1; then
+  capture_error_probe
+  if echo "$ERROR_SOURCE" | jq . >/dev/null 2>&1; then
     emit_result "E3" "pass" "Error output is valid JSON"
   else
-    # Fallback: try no args
-    run_cli "" 2>/dev/null
-    err_source="$RUN_STDERR"
-    [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
-    if echo "$err_source" | jq . >/dev/null 2>&1; then
-      emit_result "E3" "pass" "Error output is valid JSON"
-    else
-      emit_result "E3" "fail" "Error output is not valid JSON" \
-        "Even in error cases, output valid JSON."
-    fi
+    emit_result "E3" "fail" "Error output is not valid JSON" \
+      "Even in error cases, output valid JSON."
   fi
 }
 
 check_E4() {
-  run_cli "--nonexistent-flag-xyz"
-  local err_source="$RUN_STDERR"
-  [[ -z "$err_source" ]] && { run_cli "" 2>/dev/null; err_source="$RUN_STDERR"; }
-  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
-  local code; code=$(echo "$err_source" | jq -r '.code // empty' 2>/dev/null)
+  capture_error_probe
+  local code; code=$(echo "$ERROR_SOURCE" | jq -r '.code // empty' 2>/dev/null)
   if [[ -n "$code" ]]; then
     emit_result "E4" "pass" "Error has code field: $code"
   else
@@ -1173,11 +1164,8 @@ check_E4() {
 }
 
 check_E5() {
-  run_cli "--nonexistent-flag-xyz"
-  local err_source="$RUN_STDERR"
-  [[ -z "$err_source" ]] && { run_cli "" 2>/dev/null; err_source="$RUN_STDERR"; }
-  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
-  local msg; msg=$(echo "$err_source" | jq -r '.message // empty' 2>/dev/null)
+  capture_error_probe
+  local msg; msg=$(echo "$ERROR_SOURCE" | jq -r '.message // empty' 2>/dev/null)
   if [[ -n "$msg" ]]; then
     emit_result "E5" "pass" "Error has message field"
   else
@@ -1187,11 +1175,8 @@ check_E5() {
 }
 
 check_E6() {
-  run_cli "--nonexistent-flag-xyz"
-  local err_source="$RUN_STDERR"
-  [[ -z "$err_source" ]] && { run_cli "" 2>/dev/null; err_source="$RUN_STDERR"; }
-  [[ -z "$err_source" ]] && err_source="$RUN_STDOUT"
-  local sug; sug=$(echo "$err_source" | jq -r '.suggestion // empty' 2>/dev/null)
+  capture_error_probe
+  local sug; sug=$(echo "$ERROR_SOURCE" | jq -r '.suggestion // empty' 2>/dev/null)
   if [[ -n "$sug" ]]; then
     emit_result "E6" "pass" "Error has suggestion field"
   else
@@ -2364,126 +2349,10 @@ check_F8() {
 # Rule Registry
 # ═══════════════════════════════════════════════════════════
 
-# Format: ID|NAME|DIMENSION_ID|DIMENSION_NAME|PRIORITY|CHECK_FUNC
-RULE_REGISTRY=(
-  "D1|--help structured JSON|01|Discoverability|P1|check_D1"
-  "D2|per-command discovery|01|Discoverability|P2|check_D2"
-  "D3|schema format|01|Discoverability|P1|check_D3"
-  "D4|param type declarations|01|Discoverability|P1|check_D4"
-  "D5|enum declarations|01|Discoverability|P2|check_D5"
-  "D6|default declarations|01|Discoverability|P2|check_D6"
-  "D7|required annotation|01|Discoverability|P1|check_D7"
-  "D8|output schema|01|Discoverability|P2|check_D8"
-  "D9|command description|01|Discoverability|P1|check_D9"
-  "D10|version in schema|01|Discoverability|P2|check_D10"
-  "D11|--help structured JSON|01|Discoverability|P1|check_D11"
-  "D12|agent/brief.md|01|Discoverability|P1|check_D12"
-  "D13|agent/rules/|01|Discoverability|P1|check_D13"
-  "D14|agent/skills/ + skills cmd|01|Discoverability|P2|check_D14"
-  "D15|--brief flag|01|Discoverability|P1|check_D15"
-  "D16|--agent/--human mode|01|Discoverability|P1|check_D16"
-  "D17|agent/rules/ frontmatter|01|Discoverability|P1|check_D17"
-  "D18|agent/skills/ frontmatter|01|Discoverability|P1|check_D18"
-  "R1|response includes rules[]|02|Output|P1|check_R1"
-  "R2|response includes skills[]|02|Output|P1|check_R2"
-  "R3|response includes issue|02|Output|P1|check_R3"
-  "O1|default JSON output|02|Output|P0|check_O1"
-  "O2|valid JSON|02|Output|P0|check_O2"
-  "O3|schema stability|02|Output|P0|check_O3"
-  "O4|--fields filter|02|Output|P2|check_O4"
-  "O5|empty result = []|02|Output|P2|check_O5"
-  "O6|--human flag|02|Output|P2|check_O6"
-  "O7|list wrapping|02|Output|P2|check_O7"
-  "O8|pagination info|02|Output|P2|check_O8"
-  "O9|NDJSON streaming|02|Output|P2|check_O9"
-  "O10|TTY auto-detect|02|Output|P2|check_O10"
-  "E1|unified error format|03|Error|P0|check_E1"
-  "E2|errors to stderr|03|Error|P2|check_E2"
-  "E3|error JSON valid|03|Error|P2|check_E3"
-  "E4|error code field|03|Error|P0|check_E4"
-  "E5|error message field|03|Error|P0|check_E5"
-  "E6|suggestion field|03|Error|P1|check_E6"
-  "E7|no interactive mode|03|Error|P0|check_E7"
-  "E8|error code stability|03|Error|P0|check_E8"
-  "I1|long flag names|04|Input|P1|check_I1"
-  "I2|no positional ambiguity|04|Input|P1|check_I2"
-  "I3|--json-input|04|Input|P2|check_I3"
-  "I4|missing param = error|04|Input|P1|check_I4"
-  "I5|type validation|04|Input|P1|check_I5"
-  "I6|boolean flag explicit|04|Input|P2|check_I6"
-  "I7|array parameters|04|Input|P2|check_I7"
-  "I8|no implicit state|04|Input|P1|check_I8"
-  "I9|non-interactive auth|04|Input|P1|check_I9"
-  "S1|--yes guard|05|Safety|P1|check_S1"
-  "S2|default deny|05|Safety|P2|check_S2"
-  "S3|--dry-run|05|Safety|P2|check_S3"
-  "S4|input hardening|05|Safety|P1|check_S4"
-  "S5|no auto-upgrade|05|Safety|P2|check_S5"
-  "S6|destructive marked|05|Safety|P2|check_S6"
-  "S7|no silent destruction|05|Safety|P2|check_S7"
-  "S8|--sanitize|05|Safety|P1|check_S8"
-  "X1|0 = success|06|Exit Code|P1|check_X1"
-  "X2|1 = general error|06|Exit Code|P2|check_X2"
-  "X3|2 = parameter error|06|Exit Code|P0|check_X3"
-  "X4|10 = auth failure|06|Exit Code|P2|check_X4"
-  "X5|11 = permission denied|06|Exit Code|P2|check_X5"
-  "X6|20 = not found|06|Exit Code|P2|check_X6"
-  "X7|30 = conflict|06|Exit Code|P2|check_X7"
-  "X8|exit code matches JSON|06|Exit Code|P2|check_X8"
-  "X9|no exit 0 masking|06|Exit Code|P0|check_X9"
-  "C1|stdout = data only|07|Composability|P0|check_C1"
-  "C2|stderr = logs only|07|Composability|P0|check_C2"
-  "C3|pipe friendly|07|Composability|P2|check_C3"
-  "C4|--quiet|07|Composability|P2|check_C4"
-  "C5|pipe chain|07|Composability|P2|check_C5"
-  "C6|no interactive in pipe|07|Composability|P1|check_C6"
-  "C7|idempotency|07|Composability|P2|check_C7"
-  "N1|consistent naming|08|Naming|P2|check_N1"
-  "N2|kebab-case flags|08|Naming|P2|check_N2"
-  "N3|max 3 levels|08|Naming|P2|check_N3"
-  "N4|reserved flags (incl --brief/--agent/--human)|08|Naming|P1|check_N4"
-  "N5|--help|08|Naming|P2|check_N5"
-  "N6|--version semver|08|Naming|P2|check_N6"
-  "M1|AGENTS.md|09|Meta|P2|check_M1"
-  "M2|MCP export|09|Meta|P2|check_M2"
-  "M3|changelog|09|Meta|P2|check_M3"
-  "F1|issue subcommand|10|Feedback|P2|check_F1"
-  "F2|structured submission|10|Feedback|P2|check_F2"
-  "F3|categories|10|Feedback|P2|check_F3"
-  "F4|local storage|10|Feedback|P2|check_F4"
-  "F5|queryable|10|Feedback|P2|check_F5"
-  "F6|status tracking|10|Feedback|P2|check_F6"
-  "F7|issue data directory|10|Feedback|P2|check_F7"
-  "F8|issue state management|10|Feedback|P2|check_F8"
-  "G1|runtime schema validation|11|Guardrails|P1|check_G1"
-  "G2|secret detection|11|Guardrails|P1|check_G2"
-  "G3|dangerous path rejection|11|Guardrails|P1|check_G3"
-  "G4|permission levels|11|Guardrails|P2|check_G4"
-  "G5|output redaction|11|Guardrails|P2|check_G5"
-  "G6|precondition check|11|Guardrails|P1|check_G6"
-  "G7|rate/batch limits|11|Guardrails|P2|check_G7"
-  "G8|shell metachar rejection|11|Guardrails|P1|check_G8"
-  "G9|fail-closed|11|Guardrails|P1|check_G9"
-)
-
-rule_layer() {
-  case "$1" in
-    O1|O2|O3|E1|E4|E5|E7|E8|X3|X9|C1|C2|I4|I5|S1|S4|G1|G2|G3|G8)
-      echo "core"
-      ;;
-    D12|D13|D14|D17|D18|R1|R2|R3|M1|M2|M3|F1|F2|F3|F4|F5|F6|F7|F8)
-      echo "ecosystem"
-      ;;
-    *)
-      echo "recommended"
-      ;;
-  esac
-}
-
 rule_matches_active_filters() {
-  local rid="$1" rdim="$2" rpri="$3"
+  local rid="$1" rdim="$2" rpri="$3" rlayer="$4"
   [[ -n "$ACTIVE_DIMENSION" && "$rdim" != "$ACTIVE_DIMENSION" ]] && return 1
-  [[ -n "$ACTIVE_LAYER" && "$(rule_layer "$rid")" != "$ACTIVE_LAYER" ]] && return 1
+  [[ -n "$ACTIVE_LAYER" && "$rlayer" != "$ACTIVE_LAYER" ]] && return 1
   [[ -n "$ACTIVE_PRIORITY" && "$(echo "$rpri" | tr '[:upper:]' '[:lower:]')" != "$ACTIVE_PRIORITY" ]] && return 1
   [[ -n "$ACTIVE_RULE" && "$rid" != "$ACTIVE_RULE" ]] && return 1
   return 0
@@ -2550,10 +2419,9 @@ build_report() {
   local rec_total=0 rec_selected=0 rec_checked=0 rec_passed=0 rec_failed=0 rec_skipped=0 rec_ai=0 rec_warned=0 rec_compliant=true
   local eco_total=0 eco_selected=0 eco_checked=0 eco_passed=0 eco_failed=0 eco_skipped=0 eco_ai=0 eco_warned=0 eco_compliant=true
   for entry in "${RULE_REGISTRY[@]}"; do
-    IFS='|' read -r rid rname rdim rdname rpri rfunc <<< "$entry"
-    local layer; layer=$(rule_layer "$rid")
+    IFS='|' read -r rid rname rdim rdname rpri layer rfunc <<< "$entry"
     local selected=false
-    if rule_matches_active_filters "$rid" "$rdim" "$rpri"; then
+    if rule_matches_active_filters "$rid" "$rdim" "$rpri" "$layer"; then
       selected=true
     fi
     local status="not_checked"
@@ -2650,8 +2518,7 @@ build_report() {
   local dim_rules="[]"
 
   for entry in "${RULE_REGISTRY[@]}"; do
-    IFS='|' read -r rid rname rdim rdname rpri rfunc <<< "$entry"
-    local layer; layer=$(rule_layer "$rid")
+    IFS='|' read -r rid rname rdim rdname rpri layer rfunc <<< "$entry"
 
     # Find result for this rule
     local rule_result="{\"id\": \"$rid\", \"name\": $(printf '%s' "$rname" | jq -Rs .), \"priority\": \"$rpri\", \"layer\": \"$layer\", \"status\": \"skip\", \"detail\": \"Not checked\"}"
@@ -2747,12 +2614,11 @@ cmd_check() {
   if [[ -n "$rule" ]]; then
     local matched=false rule_dim="" rule_pri="" rule_layer_name=""
     for entry in "${RULE_REGISTRY[@]}"; do
-      IFS='|' read -r rid rname rdim rdname rpri rfunc <<< "$entry"
+      IFS='|' read -r rid rname rdim rdname rpri rule_layer_name rfunc <<< "$entry"
       [[ "$rid" != "$rule" ]] && continue
       matched=true
       rule_dim="$rdim"
       rule_pri="$(echo "$rpri" | tr '[:upper:]' '[:lower:]')"
-      rule_layer_name="$(rule_layer "$rid")"
       break
     done
     [[ "$matched" == true ]] || error_json "NOT_FOUND" "Unknown rule: $rule" "Use a valid rule id such as O1 or D15." 20
@@ -2777,11 +2643,11 @@ cmd_check() {
 
   local checked=0
   for entry in "${RULE_REGISTRY[@]}"; do
-    IFS='|' read -r rid rname rdim rdname rpri rfunc <<< "$entry"
+    IFS='|' read -r rid rname rdim rdname rpri rule_layer_name rfunc <<< "$entry"
 
     # Apply filters
     [[ -n "$dimension" && "$rdim" != "$dimension" ]] && continue
-    [[ -n "$layer" && "$(rule_layer "$rid")" != "$layer" ]] && continue
+    [[ -n "$layer" && "$rule_layer_name" != "$layer" ]] && continue
     [[ -n "$priority" && "$(echo "$rpri" | tr '[:upper:]' '[:lower:]')" != "$priority" ]] && continue
     [[ -n "$rule" && "$rid" != "$rule" ]] && continue
 
