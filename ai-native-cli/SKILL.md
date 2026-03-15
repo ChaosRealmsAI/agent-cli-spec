@@ -154,14 +154,24 @@ usage contract in the response**. No separate learning step needed.
 - **skills** — name + description + command. Agent sees what's available and pulls
   on demand when needed. Progressive: learns basics from rules first, goes deeper
   via skills only when the task requires it.
-- **feedback** — one-line instruction, always present. The escape hatch: if the
-  agent can't figure something out, it knows exactly how to report the problem.
+- **feedback** — one-line instruction, always present. Not optional, not an
+  escape hatch — it is the **default error-handling behavior**. When an agent
+  encounters unexpected output, a confusing response, a bug, or has a feature
+  need, it SHOULD immediately call `feedback create` without being asked.
+  The feedback field teaches this reflex on every single response.
 
-This forms a closed self-learning loop:
-  rules teach how → skills teach more → feedback catches what you can't handle
+This forms a closed self-learning + self-healing loop:
+  rules teach how → skills teach more → feedback auto-reports problems
+
+**Feedback is automatic, not manual.** The agent sees the feedback instruction
+on every call. When something goes wrong, it doesn't ask the user what to do —
+it files feedback, stored in `{PROJECT}/feedback/` as a git-tracked artifact.
+This means: problems get captured the moment they happen, in code, reviewable,
+never lost.
 
 No external CLAUDE.md rules. No AGENTS.md configuration. No README reading.
-The tool teaches itself to every agent that calls it.
+The tool teaches itself to every agent that calls it, and the agent teaches
+the tool what's broken.
 
 ### Level 3: --help (full self-description)
 
