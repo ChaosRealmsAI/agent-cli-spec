@@ -261,8 +261,9 @@ Goal: CLI is a stable, callable API. Agent can invoke, parse, and handle errors.
 - `[P0]` X9: Failures MUST exit non-zero — never exit 0 then report error in stdout
 
 **Composability** — clean pipe semantics
-- `[P0]` C1: stdout is for data ONLY
+- `[P0]` C1: stdout is for data ONLY (JSON result, buffered until complete)
 - `[P0]` C2: logs, progress, warnings go to stderr ONLY
+- `[P1]` C8: Progress MUST stream to stderr in real-time, not buffer until exit. For long-running operations, agent must see what's happening during execution, not just the final result.
 
 **Input** — fail fast on bad input
 - `[P1]` I4: Missing required param → structured error, never interactive prompt
@@ -393,7 +394,7 @@ Implement by layer — each phase gets you the next certification level.
 1. Default output is JSON — no `--json` flag needed
 2. Error handler: `{ error, code, message, suggestion }` to stderr
 3. Exit codes: 0 success, 2 param error, 1 general
-4. stdout = data only, stderr = logs only
+4. stdout = data only (buffered), stderr = logs/progress (real-time streamed)
 5. Missing param → structured error (never interactive)
 6. `--yes` guard on destructive operations
 7. Guardrails: reject secrets, path traversal, shell metacharacters
