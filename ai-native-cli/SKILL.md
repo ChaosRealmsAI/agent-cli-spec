@@ -393,6 +393,35 @@ Implement by layer — each phase gets you the next certification level.
 16. `feedback` subcommand (create/list/show/close/transition), stored in project source
 17. AGENTS.md at project root
 
+## Dogfooding — Build It, Then Use It
+
+After implementing a CLI tool, you MUST dogfood it with subagents before
+considering it done. This is not optional QA — it is part of the build process.
+
+**Required dogfooding steps:**
+
+1. **Self-audit**: Use the audit protocol (`references/audit.md`) to verify spec
+   compliance. Run every dimension. Fix failures before shipping.
+
+2. **Subagent testing**: Launch a subagent (or use `ally run/ask/plan`) to use
+   your tool as a real consumer would. The subagent should:
+   - Call `--help` and learn the tool from the response
+   - Execute the core workflow described in `rules/workflow.md`
+   - Hit edge cases: missing params, wrong types, unknown flags
+   - File feedback via `feedback create` when something is wrong
+   - Verify feedback was stored in `{PROJECT}/feedback/`
+
+3. **Cross-tool testing**: If your tool integrates with others, test the
+   integration. Use `ally compare` to run the same task through different tools
+   and verify consistent behavior.
+
+4. **Feedback review**: After dogfooding, check `feedback/` directory. Every
+   filed feedback is a real bug or gap. Fix them or document why they're
+   intentional.
+
+The goal: **by the time a user touches your tool, every obvious failure has
+already been caught by an agent and filed as feedback.**
+
 ## Feedback System Specification
 
 Every CLI tool MUST have a built-in feedback system for agents to report problems,
