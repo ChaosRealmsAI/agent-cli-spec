@@ -103,23 +103,32 @@ when/why to read this rule or skill.
 Drop a `.md` file into `agent/rules/` or `agent/skills/` and it is automatically
 registered. The CLI reads these directories at runtime. No code changes needed.
 
-## Four Levels of Self-Description
+## Progressive Disclosure — Agent Self-Learns by Using
 
-### Level 1: --brief (business card, injected into agent config)
+The core design principle: **an agent learns the tool by calling it**. No external
+docs, no pre-configuration, no training data. One call → full understanding.
 
-The smallest possible context. Output of `--brief` gets synced into CLAUDE.md /
-AGENTS.md by `cli-toolkit sync-agent`, so agents always know this tool exists.
+This works because every JSON response carries the tool's complete behavior contract
+inline. The agent reads `rules[]` once and knows how to use the tool. It sees
+`skills[]` and knows what deeper capabilities exist. It sees `feedback` and knows
+how to report problems. Zero setup, zero prior knowledge required.
+
+### Level 1: --brief (business card)
+
+The smallest context. One paragraph. Gets injected into agent system prompts.
 
 ```bash
 $ mycli --brief
 mycli — task manager, add/list/show/done for local tasks
 ```
 
-Source: `agent/brief.md`. Just one paragraph. Always in agent's system prompt.
+Source: `agent/brief.md`. Enough to know the tool exists and what it does.
 
-### Level 2: Every Command Response (always-on context)
+### Level 2: Every Command Response (self-teaching on first use)
 
-EVERY command's JSON output MUST include three fixed fields:
+EVERY command's JSON output MUST include three fixed fields. This is the key
+mechanism: **the first time an agent calls ANY command, it receives the complete
+usage contract in the response**. No separate learning step needed.
 
 ```json
 {
@@ -138,12 +147,21 @@ EVERY command's JSON output MUST include three fixed fields:
 }
 ```
 
-- **rules** — full `.md` content inline (push: agent must know)
-- **skills** — name + description + command (pull: agent reads on demand)
-- **feedback** — one-line guide, always present (fallback: can't figure it out? report it)
+- **rules** — full `.md` content inline, pushed on every call. Agent absorbs them
+  automatically. Contains: when to use this tool (trigger), how to use it step by
+  step (workflow), how to report problems (writeback). After one call, the agent
+  knows everything it needs.
+- **skills** — name + description + command. Agent sees what's available and pulls
+  on demand when needed. Progressive: learns basics from rules first, goes deeper
+  via skills only when the task requires it.
+- **feedback** — one-line instruction, always present. The escape hatch: if the
+  agent can't figure something out, it knows exactly how to report the problem.
 
-These three fields form a closed loop:
-  rules tell you how -> skills teach you more -> feedback catches what you can't handle
+This forms a closed self-learning loop:
+  rules teach how → skills teach more → feedback catches what you can't handle
+
+No external CLAUDE.md rules. No AGENTS.md configuration. No README reading.
+The tool teaches itself to every agent that calls it.
 
 ### Level 3: --help (full self-description)
 
