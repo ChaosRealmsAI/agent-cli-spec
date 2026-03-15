@@ -332,7 +332,7 @@ Goal: CLI is self-describing, well-named, and pipe-friendly. Agent discovers cap
 | `--version` | Semver version string | |
 | `--yes` | Confirm destructive ops | Required for delete/destroy |
 | `--dry-run` | Preview without executing | |
-| `--quiet` | Suppress stderr output | |
+| `--quiet` | Suppress rules/skills/feedback from response, return result only. Saves tokens for agents that already learned the tool. | |
 | `--fields` | Filter output fields | Save tokens |
 
 ### Level 3: Agent-Native (+ ecosystem — 19 rules)
