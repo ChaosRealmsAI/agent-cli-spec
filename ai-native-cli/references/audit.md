@@ -79,8 +79,8 @@ Work through each dimension in order. For each rule:
 **D15 [P1] --brief outputs agent/brief.md content**
 → Check: `<cli> --brief` output matches content of `agent/brief.md`.
 
-**D16 [P1] Default is JSON, --human for human-friendly**
-→ Check: `<cli> <any-command>` outputs JSON. `<cli> <any-command> --human` outputs non-JSON.
+**D16 [P1] Output is always JSON, no human mode**
+→ Check: `<cli> <any-command>` outputs valid JSON. No `--human` flag exists.
 
 **D17 [P1] agent/rules/*.md have YAML frontmatter (name, description)**
 → Check: Read each file, verify frontmatter has both fields.
@@ -132,8 +132,8 @@ Work through each dimension in order. For each rule:
 **O5 [P2] Empty result returns [], not error**
 → Check: Run a list command that returns no results. Must get `[]` or `{"result":[]}`, not an error.
 
-**O6 [P2] --human flag for human-friendly output**
-→ Check: `<cli> <command> --human` outputs non-JSON formatted text.
+**O6 [P2] REMOVED — no human mode**
+→ Skip: This rule no longer applies. Output is always JSON.
 
 **O7 [P2] Multiple results in JSON array**
 → Check: List command returns array, not single object.
@@ -275,7 +275,7 @@ Work through each dimension in order. For each rule:
 ### Dimension 08: Naming (N1-N6)
 
 **N4 [P1] Reserved flags present**
-→ Check: --help schema supports --agent, --human, --brief, --help, --version, --yes, --dry-run, --quiet, --fields.
+→ Check: --help schema supports --brief, --help, --version, --yes, --dry-run, --quiet, --fields.
 
 **N1 [P2] Consistent verb/noun pattern**
 → Check: All commands follow same pattern (e.g., all `noun verb` or all `verb noun`).

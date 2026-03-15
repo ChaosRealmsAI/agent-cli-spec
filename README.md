@@ -4,6 +4,10 @@ A design spec for building CLI tools that AI agents can safely and reliably use.
 
 Covers structured JSON output, error handling, input contracts, safety guardrails, exit codes, and agent self-description across 98 rules in 11 dimensions.
 
+## Why
+
+Most CLIs were designed for humans — colorized output, interactive prompts, ambiguous exit codes. When an AI agent calls these tools, it can't parse the output, gets stuck on prompts, or silently misinterprets errors. This spec defines what a CLI needs to be a reliable building block in agentic workflows.
+
 ## Install
 
 ```bash

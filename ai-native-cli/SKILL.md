@@ -19,7 +19,7 @@ reliable for AI agents to use.
 
 ## Core Philosophy
 
-1. **Agent-first** -- default output is JSON; human-friendly is opt-in via `--human`
+1. **Agent-only** -- output is always JSON, no human-friendly mode
 2. **Agent is untrusted** -- validate all input at the same level as a public API
 3. **Fail-Closed** -- when validation logic itself errors, deny by default
 4. **Verifiable** -- every rule is written so it can be automatically checked
@@ -45,17 +45,15 @@ Certification maps to layers:
 
 ## Output Mode
 
-Default is agent mode (JSON). Explicit flags to switch:
+Output is always JSON. No human-friendly mode. No flags needed.
 
 ```bash
-$ mycli list              # default = JSON output (agent mode)
-$ mycli list --human      # human-friendly: colored, tables, formatted
-$ mycli list --agent      # explicit agent mode (override config if needed)
+$ mycli list              # JSON output, always
 ```
 
-- **Default (no flag)** — JSON to stdout. Agent never needs to add a flag.
-- **--human** — human-friendly format (colors, tables, progress bars)
-- **--agent** — explicit JSON mode (useful when env/config overrides default)
+- All output is JSON to stdout. Period.
+- No `--human`, no `--agent`, no mode switching.
+- If a human needs to read it, pipe through `jq`.
 
 ## agent/ Directory Convention
 
@@ -246,7 +244,7 @@ Goal: CLI is self-describing, well-named, and pipe-friendly. Agent discovers cap
 - `[P1]` D9: Every command has a description
 - `[P1]` D11: `--help` outputs JSON with help, rules, skills, feedback, commands
 - `[P1]` D15: `--brief` outputs `agent/brief.md` content
-- `[P1]` D16: Default JSON (agent mode), `--human` for human-friendly
+- `[P1]` D16: Output is always JSON, no human mode
 - `[P2]` D2/D5/D6/D8/D10: per-command help, enums, defaults, output schema, version
 
 **Input** — unambiguous calling convention
@@ -271,7 +269,7 @@ Goal: CLI is self-describing, well-named, and pipe-friendly. Agent discovers cap
 - `[P2]` C3/C4/C5/C7: pipe-friendly, --quiet, pipe chain, idempotency
 
 **Naming** — predictable flag conventions
-- `[P1]` N4: Reserved flags (--agent, --human, --brief, --help, --version, --yes, --dry-run, --quiet, --fields)
+- `[P1]` N4: Reserved flags (--brief, --help, --version, --yes, --dry-run, --quiet, --fields)
 - `[P2]` N1/N2/N3/N5/N6: consistent naming, kebab-case, max 3 levels, --version semver
 
 **Guardrails**
@@ -283,8 +281,6 @@ Goal: CLI is self-describing, well-named, and pipe-friendly. Agent discovers cap
 
 | Flag | Semantics | Notes |
 |------|-----------|-------|
-| `--agent` | JSON output (default) | Explicit override |
-| `--human` | Human-friendly output | Colors, tables, formatted |
 | `--brief` | One-paragraph identity | For sync into agent config |
 | `--help` | Full self-description JSON | Brief + commands + rules + skills + feedback |
 | `--version` | Semver version string | |
@@ -359,8 +355,7 @@ Implement by layer — each phase gets you the next certification level.
 **Phase 2: Agent-Ready (+ recommended)**
 8. `--help` returns structured JSON (help, commands[], rules[], skills[])
 9. `--brief` reads and outputs `agent/brief.md` content
-10. `--human` flag switches to human-friendly format
-11. Reserved flags: --agent, --version, --dry-run, --quiet, --fields
+10. Reserved flags: --version, --dry-run, --quiet, --fields
 12. Exit codes: 20 not found, 30 conflict, 10 auth, 11 permission
 
 **Phase 3: Agent-Native (+ ecosystem)**
