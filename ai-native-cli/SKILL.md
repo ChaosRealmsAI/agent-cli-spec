@@ -1,9 +1,15 @@
 ---
 name: ai-native-cli
 description: >
-  AI-Native CLI design spec. Use when building CLI tools, designing command-line
-  interfaces, or scaffolding new CLI projects. Covers structured output, error
-  handling, input contracts, safety guardrails, and exit codes.
+  AI-Native CLI design spec. Use when building CLI tools, designing
+  command-line interfaces, or scaffolding new CLI projects. Covers
+  structured JSON output, error handling, input contracts, safety
+  guardrails, exit codes, and agent self-description. Includes an
+  audit protocol for verifying CLI compliance.
+license: MIT
+metadata:
+  author: zhuanz
+  version: "0.1.0"
 ---
 
 # Agent-Friendly CLI Spec v0.1
