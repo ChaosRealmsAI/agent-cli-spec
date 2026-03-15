@@ -9,7 +9,7 @@ description: >
 license: MIT
 metadata:
   author: zhuanz
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # Agent-Friendly CLI Spec v0.1
@@ -35,7 +35,7 @@ Use layers for migration and certification:
 
 - **core** -- execution contract: JSON, errors, exit codes, stdout/stderr, safety
 - **recommended** -- better machine UX: self-description, explicit modes, richer schemas
-- **ecosystem** -- agent-native integration: `agent/`, `skills`, `issue`, inline context
+- **ecosystem** -- agent-native integration: `agent/`, `skills`, `feedback`, inline context
 
 Certification maps to layers:
 
@@ -136,16 +136,16 @@ EVERY command's JSON output MUST include three fixed fields:
     {"name": "getting-started", "description": "Quick start guide", "command": "mycli skills getting-started"},
     {"name": "batch-import",    "description": "Import from CSV",   "command": "mycli skills batch-import"}
   ],
-  "issue": "Any problem, bad output, or confusion — run: mycli issue create --type <bug|requirement|suggestion|bad-output> --message '...'"
+  "feedback": "Any problem, bad output, or confusion — run: mycli feedback create --type <bug|requirement|suggestion|bad-output> --message '...'"
 }
 ```
 
 - **rules** — full `.md` content inline (push: agent must know)
 - **skills** — name + description + command (pull: agent reads on demand)
-- **issue** — one-line guide, always present (fallback: can't figure it out? report it)
+- **feedback** — one-line guide, always present (fallback: can't figure it out? report it)
 
 These three fields form a closed loop:
-  rules tell you how -> skills teach you more -> issue catches what you can't handle
+  rules tell you how -> skills teach you more -> feedback catches what you can't handle
 
 ### Level 3: --help (full self-description)
 
@@ -167,7 +167,7 @@ Complete identity + capabilities. Only called for deep exploration.
   "skills": [
     {"name": "getting-started", "description": "Quick start guide", "command": "mycli skills getting-started"}
   ],
-  "issue": "Any problem — run: mycli issue create ..."
+  "feedback": "Any problem — run: mycli feedback create ..."
 }
 ```
 
@@ -186,8 +186,8 @@ $ mycli skills getting-started
 
 ```
 --brief              → always in agent's prompt (via sync-agent)
-every command        → data + rules + skills list + issue (always attached)
---help               → brief + commands + rules + skills + issue (first contact)
+every command        → data + rules + skills list + feedback (always attached)
+--help               → brief + commands + rules + skills + feedback (first contact)
 skills <name>        → full skill content + rules (on demand)
 ```
 
@@ -244,7 +244,7 @@ Goal: CLI is self-describing, well-named, and pipe-friendly. Agent discovers cap
 - `[P1]` D4: All parameters have type declarations
 - `[P1]` D7: Parameters annotated as required/optional
 - `[P1]` D9: Every command has a description
-- `[P1]` D11: `--help` outputs JSON with help, rules, skills, commands
+- `[P1]` D11: `--help` outputs JSON with help, rules, skills, feedback, commands
 - `[P1]` D15: `--brief` outputs `agent/brief.md` content
 - `[P1]` D16: Default JSON (agent mode), `--human` for human-friendly
 - `[P2]` D2/D5/D6/D8/D10: per-command help, enums, defaults, output schema, version
@@ -286,7 +286,7 @@ Goal: CLI is self-describing, well-named, and pipe-friendly. Agent discovers cap
 | `--agent` | JSON output (default) | Explicit override |
 | `--human` | Human-friendly output | Colors, tables, formatted |
 | `--brief` | One-paragraph identity | For sync into agent config |
-| `--help` | Full self-description JSON | Brief + commands + rules + skills + issue |
+| `--help` | Full self-description JSON | Brief + commands + rules + skills + feedback |
 | `--version` | Semver version string | |
 | `--yes` | Confirm destructive ops | Required for delete/destroy |
 | `--dry-run` | Preview without executing | |
@@ -307,22 +307,22 @@ Goal: CLI has identity, behavior contract, skill system, and feedback loop. Agen
 **Response Structure** — inline context on every call
 - `[P1]` R1: Every response includes `rules[]` (full content from agent/rules/)
 - `[P1]` R2: Every response includes `skills[]` (name + description + command)
-- `[P1]` R3: Every response includes `issue` (feedback guide)
+- `[P1]` R3: Every response includes `feedback` (feedback guide)
 
 **Meta** — project-level integration
 - `[P2]` M1: AGENTS.md at project root
 - `[P2]` M2: Optional MCP tool schema export
 - `[P2]` M3: CHANGELOG.md marks breaking changes
 
-**Feedback** — built-in issue system
-- `[P2]` F1: `issue` subcommand (create/list/show)
-- `[P2]` F2: Structured submission with version/context/exit_code
-- `[P2]` F3: Categories: bug / requirement / suggestion / bad-output
-- `[P2]` F4: Issues stored locally, no external service dependency
-- `[P2]` F5: `issue list` / `issue show <id>` queryable
-- `[P2]` F6: Issues have status tracking (open/in-progress/resolved/closed)
-- `[P2]` F7: Issue JSON has all required fields (id, type, status, message, created_at, updated_at)
-- `[P2]` F8: All issues have status field
+**Feedback** — built-in feedback system, stored in project code
+- `[P1]` F1: `feedback` subcommand (create/list/show)
+- `[P1]` F2: Structured submission with version/context/exit_code
+- `[P1]` F3: Categories: bug / requirement / suggestion / bad-output
+- `[P1]` F4: Feedback stored in project source (`{PROJECT}/feedback/`), committed to git
+- `[P1]` F5: `feedback list` / `feedback show <id>` queryable
+- `[P2]` F6: Feedback has status tracking (open/in-progress/resolved/closed)
+- `[P2]` F7: Feedback JSON has all required fields (id, type, status, message, created_at, updated_at)
+- `[P2]` F8: All feedback entries have status field
 
 ## Exit Code Table
 
@@ -365,30 +365,40 @@ Implement by layer — each phase gets you the next certification level.
 
 **Phase 3: Agent-Native (+ ecosystem)**
 13. Create `agent/` directory: `brief.md`, `rules/trigger.md`, `rules/workflow.md`, `rules/writeback.md`
-14. Every command response appends: rules[] + skills[] + issue
+14. Every command response appends: rules[] + skills[] + feedback
 15. `skills` subcommand: list all / show one with full content
-16. `issue` subcommand for feedback (create/list/show/close/transition)
+16. `feedback` subcommand (create/list/show/close/transition), stored in project source
 17. AGENTS.md at project root
 
-## Issue System Specification
+## Feedback System Specification
 
-Every CLI tool MUST have a built-in issue system for agents to report problems,
-request features, and track feedback.
+Every CLI tool MUST have a built-in feedback system for agents to report problems,
+request features, and track feedback. Feedback is a first-class project artifact —
+it MUST be stored in the project source code and committed to version control.
 
 ### Storage
 
-Issues are stored in a dedicated directory:
+Feedback MUST be stored in the project's source directory, not in hidden user
+directories. This ensures feedback is version-controlled and visible to all
+contributors.
 
 ```
-~/.{toolname}/issues/       # or {TOOL_DIR}/issues/
+{PROJECT_ROOT}/feedback/
 ├── 001.json
 ├── 002.json
 └── 003.json
 ```
 
-Each issue is a single JSON file named `{id}.json`.
+Each feedback entry is a single JSON file named `{id}.json`.
 
-### Issue Fields
+**Why in project code, not `~/.toolname/`:**
+- Feedback is a project artifact, not user-local state
+- Git tracks who reported what and when
+- Other developers and agents can see open feedback
+- Code review catches feedback patterns (recurring bugs = design problem)
+- Feedback survives machine changes
+
+### Feedback Fields
 
 ```json
 {
@@ -410,7 +420,7 @@ Required fields:
 - **id** — unique identifier
 - **type** — one of: `bug`, `requirement`, `suggestion`, `bad-output`
 - **status** — one of: `open`, `in-progress`, `resolved`, `closed`
-- **message** — description of the issue
+- **message** — description of the feedback
 - **context** — object with `version`, `command`, `exit_code`
 - **created_at** — ISO 8601 timestamp
 - **updated_at** — ISO 8601 timestamp
@@ -419,16 +429,16 @@ Required fields:
 
 | Command | Description |
 |---------|-------------|
-| `issue create --type <type> --message <msg>` | Create a new issue |
-| `issue list [--type <type>] [--status <status>]` | List issues, filterable |
-| `issue show <id>` | Show single issue detail |
-| `issue close <id>` | Close an issue |
-| `issue transition <id> --status <status>` | Change issue status |
+| `feedback create --type <type> --message <msg>` | Create new feedback entry |
+| `feedback list [--type <type>] [--status <status>]` | List feedback, filterable |
+| `feedback show <id>` | Show single feedback detail |
+| `feedback close <id>` | Close a feedback entry |
+| `feedback transition <id> --status <status>` | Change feedback status |
 
 ### Queryable
 
-Issues MUST be filterable by `--type` and `--status`:
+Feedback MUST be filterable by `--type` and `--status`:
 
 ```bash
-$ mycli issue list --type bug --status open
-$ mycli issue list --status resolved
+$ mycli feedback list --type bug --status open
+$ mycli feedback list --status resolved

@@ -114,8 +114,8 @@ Work through each dimension in order. For each rule:
 **R2 [P1] Every response includes skills[]**
 → Check: Same output has `skills` array.
 
-**R3 [P1] Every response includes issue**
-→ Check: Same output has `issue` string.
+**R3 [P1] Every response includes feedback**
+→ Check: Same output has `feedback` string.
 
 **O1 [P0] Default output is JSON**
 → Check: `<cli> <command>` (no flags) outputs valid JSON.
@@ -305,29 +305,29 @@ Work through each dimension in order. For each rule:
 
 ### Dimension 10: Feedback (F1-F8)
 
-**F1 [P2] issue subcommand exists**
-→ Check: `<cli> issue --help` or `<cli> issue list` works.
+**F1 [P1] feedback subcommand exists**
+→ Check: `<cli> feedback --help` or `<cli> feedback list` works.
 
-**F2 [P2] Structured submission**
-→ Check: `<cli> issue create --type bug --message "test"` returns structured JSON.
+**F2 [P1] Structured submission**
+→ Check: `<cli> feedback create --type bug --message "test"` returns structured JSON.
 
-**F3 [P2] Categories: bug/requirement/suggestion/bad-output**
+**F3 [P1] Categories: bug/requirement/suggestion/bad-output**
 → Check: --type accepts all four values.
 
-**F4 [P2] Issues stored locally**
-→ Check: After creating an issue, a file appears in the issues directory.
+**F4 [P1] Feedback stored in project source**
+→ Check: After creating feedback, a JSON file appears in `{PROJECT_ROOT}/feedback/` (not `~/.toolname/`).
 
-**F5 [P2] issue list / issue show queryable**
+**F5 [P1] feedback list / feedback show queryable**
 → Check: Both commands return JSON.
 
-**F6 [P2] Issues have status tracking**
-→ Check: `<cli> issue transition <id> --status in-progress` works.
+**F6 [P2] Feedback has status tracking**
+→ Check: `<cli> feedback transition <id> --status in-progress` works.
 
-**F7 [P2] Issue JSON has required fields**
+**F7 [P2] Feedback JSON has required fields**
 → Check: id, type, status, message, created_at, updated_at all present.
 
-**F8 [P2] All issues have status field**
-→ Check: Every issue in `issue list` has `status`.
+**F8 [P2] All feedback entries have status field**
+→ Check: Every entry in `feedback list` has `status`.
 
 ### Dimension 11: Guardrails (G1-G9)
 
